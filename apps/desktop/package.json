@@ -1,0 +1,38 @@
+{
+  "name": "@axon/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Axon Voice desktop shell (Electron main, preload, renderer).",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.tests.json --noEmit",
+    "verify:tools": "electron-vite build && electron scripts/verify-tools.cjs",
+    "verify:voice": "electron-vite build && electron scripts/verify-voice.cjs",
+    "verify:browser": "electron-vite build && electron scripts/verify-browser.cjs",
+    "verify:agent": "electron-vite build && electron scripts/verify-agent.cjs",
+    "verify:voice-agent": "electron-vite build && electron scripts/verify-voice-agent.cjs",
+    "verify:desktop": "electron-vite build && electron scripts/verify-desktop.cjs",
+    "smoke:assemblyai": "electron-vite build && electron scripts/smoke-assemblyai.cjs",
+    "verify:persistence": "electron-vite build && electron scripts/verify-persistence.cjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.123.0",
+    "@axon/core": "*",
+    "ws": "^8.21.3",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^44.1.0",
+    "electron-vite": "^3.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vite": "^6.0.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true,
+    // Tests span both worlds: they import main-process modules (Node globals)
+    // and renderer modules (DOM types such as AnalyserNode). Giving them their
+    // own project is what keeps `tsconfig.node.json` DOM-free — the main
+    // process must not be able to reach `document`, and widening its lib to
+    // satisfy a renderer test would remove exactly that guarantee.
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["tests/**/*.ts", "src/**/*.ts", "src/**/*.tsx"]
+}

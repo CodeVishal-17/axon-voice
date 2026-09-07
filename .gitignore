@@ -1,0 +1,19 @@
+node_modules/
+dist/
+out/
+.vite/
+*.tsbuildinfo
+
+.env
+.env.local
+
+# Axon runtime data (event logs, screenshots, agent workspace)
+.axon-runtime/
+artifacts/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

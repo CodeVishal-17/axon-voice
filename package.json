@@ -1,0 +1,34 @@
+{
+  "name": "axon-voice",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Axon Voice — a voice-first desktop AI agent.",
+  "license": "UNLICENSED",
+  "engines": { "node": ">=20.19" },
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "dev": "npm run build --workspace @axon/core && npm run dev --workspace @axon/desktop",
+    "build": "npm run build --workspace @axon/core && npm run build --workspace @axon/desktop",
+    "typecheck": "npm run typecheck --workspace @axon/core && npm run typecheck --workspace @axon/desktop",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify:tools": "npm run verify:tools --workspace @axon/desktop",
+    "verify:voice": "npm run verify:voice --workspace @axon/desktop",
+    "verify:browser": "npm run verify:browser --workspace @axon/desktop",
+    "verify:agent": "npm run verify:agent --workspace @axon/desktop",
+    "verify:voice-agent": "npm run verify:voice-agent --workspace @axon/desktop",
+    "verify:desktop": "npm run verify:desktop --workspace @axon/desktop",
+    "smoke:assemblyai": "npm run smoke:assemblyai --workspace @axon/desktop",
+    "verify:persistence": "npm run verify:persistence --workspace @axon/desktop",
+    "verify:all": "npm run typecheck && npm run lint && npm run test && npm run verify:tools && npm run verify:voice && npm run verify:browser && npm run verify:persistence && npm run verify:agent && npm run verify:voice-agent && npm run verify:desktop"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "@types/node": "^20.17.0",
+    "eslint": "^9.20.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.24.0",
+    "vitest": "^3.0.0"
+  }
+}
