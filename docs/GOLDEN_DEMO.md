@@ -65,6 +65,13 @@ does — the same path works for any app whose UI is exposed to Windows UI Autom
 
 ### Optional beats (only if they worked in your off-camera run)
 
+- **"Open GitHub and check my latest PR."** — the user's own signed-in browser, read and clicked through
+  its accessibility structure ([BROWSER.md](BROWSER.md)). Do it **before** the Paint beat. It reliably
+  names the latest PR accurately; it opens the PR page itself only some of the time (1 of 3 on the final
+  build). To make opening the PR likelier, say *"Open my latest pull request on GitHub and read its checks."*
+- **"Open Paint and draw a house."** → **Allow** — a new Paint window, the house built up in 10 visible
+  steps on Paint's real canvas, verified by reading the canvas back. Hands off mouse and keyboard while
+  it draws. Close earlier Paint windows first. **Re-check it off-camera on the day** — see Evidence.
 - **"What time is it?"** — the machine's clock via `system.time`, not the model's guess. Very reliable.
 - **"Open Calculator."** — a built-in app: opens without asking, verified by its window.
 - **The form act** from [DEMO.md](DEMO.md) (fill safe fields, password field refused, deny Submit) — the
@@ -83,7 +90,10 @@ does — the same path works for any app whose UI is exposed to Windows UI Autom
 | Read Spotify (display asleep → blank window) | 3 | honest every time: "I cannot see what song is playing" — never invented content |
 | Open YouTube in default browser (Dia) | 1 | verified |
 | Open WhatsApp → Deny → nothing ran | 2 | 2/2 |
-| API key refusal | 2 | 2/2 |
+| API key refusal | 3 | 3/3 |
+| Full path 2–7 in one session (final build) | 1 | all six beats passed: identity; Spotify allowed + verified; Spotify read (library + now playing); YouTube in Dia; WhatsApp denied; key refused |
+| "Open Paint and draw a house." | 1 in that session | drawn and verified (340/340 canvas samples), 17.4 s tool time. **Afterwards Paint on this machine began hanging on its second Paste — reproduced with the committed code as well, so a machine-state problem, not a code change; not re-verified after a restart.** |
+| "Open GitHub and check my latest PR." | 3 on final build | 3/3 named the right PR accurately; 1/3 opened the PR page itself |
 | Wake word "Hey Axon" | — | **not provable here** — needs a person at the mic (see `docs/wake-word.md`) |
 
 ## If something goes wrong

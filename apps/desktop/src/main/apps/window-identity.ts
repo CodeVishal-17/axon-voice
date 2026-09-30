@@ -36,6 +36,23 @@ export interface Ownership {
   readonly evidence: OwnershipEvidence;
 }
 
+/**
+ * A window title without its notification count, and the count on its own.
+ *
+ * MEASURED LIVE: WhatsApp titles its window "WhatsApp (7)" while seven chats
+ * are unread, and the model took "WhatsApp (7)" for a different application.
+ * The count is the window's STATE, never part of its identity: "(7) Inbox",
+ * "WhatsApp (7)" and "WhatsApp (99+)" are all the same window as "WhatsApp".
+ */
+export function withoutNotificationCount(title: string): { readonly title: string; readonly unread: number | null } {
+  const match = /^\s*\((\d{1,4})\+?\)\s+(.+)$/.exec(title) ?? /^(.+?)\s+\((\d{1,4})\+?\)\s*$/.exec(title);
+  if (!match) return { title, unread: null };
+  const leading = /^\s*\(/.test(title);
+  const rest = (leading ? match[2] : match[1])!.trim();
+  const count = Number(leading ? match[1] : match[2]);
+  return rest === '' ? { title, unread: null } : { title: rest, unread: count };
+}
+
 /** Whole words of the title contain the whole name: "spotify premium" names Spotify. */
 export function titleNames(title: string, name: string): boolean {
   const words = (text: string): string =>
@@ -117,5 +134,25 @@ export function chooseWindow(candidates: readonly DesktopWindow[]): WindowChoice
   if (candidates.length === 1 && candidates[0]) return { kind: 'one', window: candidates[0] };
   const visible = candidates.filter((window) => !window.minimized);
   if (visible.length === 1 && visible[0]) return { kind: 'one', window: visible[0] };
+  const same = oneWindowTwice(visible);
+  if (same) return { kind: 'one', window: same };
   return { kind: 'ambiguous', windows: candidates };
+}
+
+/**
+ * MEASURED LIVE: WhatsApp shows two top-level windows — its frame "WhatsApp"
+ * and its web-content host "(7) WhatsApp" — which are ONE application window.
+ * Windows whose titles differ only by a notification count are taken as one:
+ * the one in front, else the one without a count. Two windows with identical
+ * titles and no count (two "Untitled - Notepad") are still two, and still asked.
+ */
+function oneWindowTwice(windows: readonly DesktopWindow[]): DesktopWindow | null {
+  if (windows.length < 2) return null;
+  const parts = windows.map((window) => withoutNotificationCount(window.title));
+  if (!parts.some((part) => part.unread !== null)) return null;
+  if (new Set(parts.map((part) => part.title)).size !== 1) return null;
+  const front = windows.filter((window) => window.foreground);
+  if (front.length === 1) return front[0]!;
+  const plain = windows.filter((_, index) => parts[index]!.unread === null);
+  return plain.length === 1 ? plain[0]! : null;
 }

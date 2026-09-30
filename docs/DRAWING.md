@@ -29,7 +29,25 @@ synthetic mouse input. Axon has none anywhere (`security-audit.test.ts` sweeps f
 exposes as a control is **Edit ▸ Paste**. So Axon draws the way it safely can: each step of a fixed plan is
 rendered by Axon to a whole picture, placed on the clipboard, and pasted by pressing Paint's own Paste item
 through UI Automation. The audience watches Paint's actual canvas change step by step — it is progressive
-layered drawing, not brush strokes.
+drawing on the real Paint canvas, not brush strokes.
+
+### Real brush / pointer movement — investigated, not implemented
+
+Every Windows mechanism that moves a visible pointer or makes a brush stroke on Paint's canvas is
+**synthetic input delivered to whatever is under the pointer at that instant**, not to a chosen window:
+
+| Mechanism | Why it is not safe here |
+|---|---|
+| `SetCursorPos` + `SendInput` (mouse down / move / up) | Input goes to the window under the cursor when it is delivered. A toast, a dialog, or the user's own hand between Axon's check and the event turns a drag into a drag in *another* application. There is no "only into this window" form of it. |
+| Synthetic pointer injection (`InjectSyntheticPointerInput`) | Same: screen-coordinate input, delivered to whatever is there. |
+| Posting `WM_LBUTTONDOWN` / `WM_MOUSEMOVE` to Paint's window | Cross-process message injection (the engine's security test forbids `SendMessage` / `PostMessage`); it would not move a visible pointer either, and Store Paint's canvas is a composition surface that does not promise to honour posted mouse messages. |
+| UI Automation on the canvas | The canvas exposes no pattern at all (measured). |
+| `ClipCursor` to confine the pointer | Confines where the pointer goes, not which window receives the click — a window that appears over the canvas still receives it. |
+
+Clamping the coordinates to a verified canvas and re-checking the target between events narrows the race
+but cannot close it, and closing it is the security property. So Axon keeps its rule: **no coordinate
+input anywhere** (`SendInput`, `SetCursorPos`, `mouse_event`, `keybd_event` remain absent and tested
+absent), and draws with Paint's own Paste, which acts only on the window Axon launched.
 
 ## How it works
 
@@ -85,7 +103,13 @@ landed). The result also reports whether Paint was in the foreground at the end.
 - **The existing approval**, through the one dispatcher and broker. The dialog says Paint, the drawing, and
   that each step goes through the clipboard. Denied means: no Paint, no clipboard write, no paste.
 - **Your clipboard** is saved before the first step and restored afterwards — on success and on failure. It
-  is held in memory only and never read, logged or sent.
+  is held in memory only and never read, logged or sent. If it cannot be put back, the clipboard is left
+  **empty** — never holding Axon's drawing — and the result says so (`clipboard: "restored"` or
+  `"emptied: …"`).
+  *Found live on 2026-09-30:* Electron 44's `clipboard.write` refuses the very items `clipboard.read`
+  returned, the failure was swallowed, and Paint's copy of the drawing stayed on the clipboard. Fixed: the
+  snapshot now copies the data and restore builds new items (all formats, else the standard ones, else
+  empty); tests cover a refused and a failed restore.
 - **What the model is told:** the drawing, its step names, and the verification. Never a window handle,
   runtime id, process id or AppID.
 

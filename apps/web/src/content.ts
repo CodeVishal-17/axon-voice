@@ -41,9 +41,9 @@ export const CAPABILITIES: readonly Capability[] = [
   },
   {
     title: 'Browse the web',
-    detail: 'Hands a page to your own default browser, whichever one Windows says it is. Or opens it in Axon’s own browser window, where it can read, scroll and follow links from the page structure.',
-    say: 'Open YouTube in my browser.',
-    tools: ['web.open', 'browser.open', 'browser.navigate', 'browser.read', 'browser.scroll'],
+    detail: 'Opens a page in your own default browser, whichever one Windows says it is, then reads it, follows its links and scrolls it through the page’s accessibility structure — no scripts, no coordinates. Buttons ask first; passwords are never typed. Or uses Axon’s own separate browser window for public pages.',
+    say: 'Open GitHub and check my latest PR.',
+    tools: ['web.open', 'web.read', 'web.find', 'web.click', 'web.scroll', 'browser.open', 'browser.read'],
     glyph: 'browser',
   },
   {

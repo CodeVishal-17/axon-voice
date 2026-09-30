@@ -45,7 +45,7 @@ import {
   type AppCatalog,
   type DiscoveredApp,
 } from '../../apps/app-catalog.js';
-import { chooseWindow, ownerOf, windowsOf } from '../../apps/window-identity.js';
+import { chooseWindow, ownerOf, windowsOf, withoutNotificationCount } from '../../apps/window-identity.js';
 
 /**
  * A window reference.
@@ -220,7 +220,9 @@ function toWindowOutput(
       ref: window.ref,
       // UNTRUSTED. A window title is written by whatever application owns it,
       // and any application on this machine can name its window anything.
-      title: window.title,
+      // A notification count is the window's state, not its name.
+      title: withoutNotificationCount(window.title).title,
+      unread: withoutNotificationCount(window.title).unread,
       foreground: window.foreground,
       minimized: window.minimized,
       // Which permitted application Axon believes it is, when it recognises

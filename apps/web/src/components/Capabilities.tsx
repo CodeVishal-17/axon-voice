@@ -15,7 +15,7 @@ export function Capabilities(): React.JSX.Element {
     <Section
       id="can-do"
       eyebrow="What Axon can do"
-      heading="Twenty-eight tools. No surprises."
+      heading="Thirty-three tools. No surprises."
       lede="These are the actions Axon can take today, each backed by a named tool in its registry. Say it in a sentence; Axon works out which of these it needs."
       className="can-do"
     >

@@ -18,8 +18,8 @@ import { ApprovalBroker } from '../src/main/safety/approval-broker.js';
 import { Policy } from '../src/main/safety/policy.js';
 import { TurnBudget } from '../src/main/safety/turn-budget.js';
 import { ToolRegistry } from '../src/main/tools/registry.js';
-import { AppCatalog, buildCatalog, executableOf } from '../src/main/apps/app-catalog.js';
-import { chooseWindow, hasIdentity, ownerOf, windowsOf } from '../src/main/apps/window-identity.js';
+import { AppCatalog, buildCatalog, executableOf, resolveApp } from '../src/main/apps/app-catalog.js';
+import { chooseWindow, hasIdentity, ownerOf, windowsOf, withoutNotificationCount } from '../src/main/apps/window-identity.js';
 import {
   MAX_OBSERVE_SKIP,
   WindowsDesktop,
@@ -761,5 +761,53 @@ describe('Phase 4A security', () => {
 
   it('the renderer cannot reach identity or deep reads', () => {
     expect(read('../preload/index.ts')).not.toMatch(/ui\.read|observeControls|ownerOf|appUserModelId|processId/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A notification count is state, not identity (found live: "(7) WhatsApp")
+// ---------------------------------------------------------------------------
+
+describe('a notification count is the window\'s state, never its name', () => {
+  it('separates the count from the title, at either end', () => {
+    expect(withoutNotificationCount('WhatsApp (7)')).toEqual({ title: 'WhatsApp', unread: 7 });
+    expect(withoutNotificationCount('(7) WhatsApp')).toEqual({ title: 'WhatsApp', unread: 7 });
+    expect(withoutNotificationCount('WhatsApp (99+)')).toEqual({ title: 'WhatsApp', unread: 99 });
+    expect(withoutNotificationCount('WhatsApp')).toEqual({ title: 'WhatsApp', unread: null });
+    expect(withoutNotificationCount('Report (final) draft')).toEqual({ title: 'Report (final) draft', unread: null });
+  });
+
+  it('resolves "WhatsApp (7)" to WhatsApp — not to nothing, and not to WhatsApp Beta', () => {
+    for (const request of ['WhatsApp (7)', '(7) WhatsApp', 'WhatsApp (12+)']) {
+      const found = resolveApp(APPS, request);
+      expect(found.kind, request).toBe('match');
+      expect(found.kind === 'match' && found.app.name).toBe('WhatsApp');
+    }
+    expect(resolveApp(APPS, 'WhatsApp Beta (3)').kind === 'match' && (resolveApp(APPS, 'WhatsApp Beta (3)') as { app: { name: string } }).app.name).toBe('WhatsApp Beta');
+  });
+
+  it('takes WhatsApp\'s frame and its "(7) WhatsApp" content window as ONE window', () => {
+    const frame = win('WhatsApp', { appUserModelId: WHATSAPP_ID }, { foreground: true });
+    const content = win('(7) WhatsApp', { appUserModelId: WHATSAPP_ID });
+    const owned = windowsOf(app('WhatsApp'), [frame, content], APPS);
+    expect(owned.windows).toHaveLength(2);
+    expect(chooseWindow(owned.windows)).toEqual({ kind: 'one', window: frame });
+    // Neither in front: the one without a count.
+    const quietFrame = { ...frame, foreground: false };
+    expect(chooseWindow([content, quietFrame])).toEqual({ kind: 'one', window: quietFrame });
+  });
+
+  it('still asks between two genuinely separate windows', () => {
+    const a = win('Untitled - Notepad', { executable: 'c:\\windows\\notepad.exe' });
+    const b = win('Untitled - Notepad', { executable: 'c:\\windows\\notepad.exe' });
+    expect(chooseWindow([a, b]).kind).toBe('ambiguous');
+    expect(chooseWindow([win('WhatsApp (2)'), win('Signal (3)')]).kind).toBe('ambiguous');
+  });
+
+  it('never shows the model a count-bearing title as a separate application', async () => {
+    const desktop = { available: true, list: () => Promise.resolve([win('(7) WhatsApp', { appUserModelId: WHATSAPP_ID })]), act: () => Promise.resolve(true) };
+    const tool = createWindowListTool(desktop as never, new WindowRegistry());
+    const output = (await tool.execute({}, { observe: () => undefined } as never)) as { windows: { title: string; unread: number | null }[] };
+    expect(output.windows[0]).toMatchObject({ title: 'WhatsApp', unread: 7 });
   });
 });

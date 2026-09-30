@@ -8,7 +8,7 @@ fields and scroll — generically, on any site, with no site-specific code:
 | `web.open` | Opens an address in your default browser (existing) | no — URL policy applies |
 | `web.read` | The page's title, address, text (fenced as untrusted, in parts) and its links / buttons / fields as references `t12` | no |
 | `web.find` | Lines of text and controls whose names contain some words | no |
-| `web.click` | Follows a link / tab / row, or presses a button, by reference; then reads the page again and reports what changed | links: no · buttons and consequential labels: **yes** |
+| `web.click` | Follows a link / tab / row, or presses a button, by reference; then reads the page again, reports what changed, and returns the page it landed on (text + fresh references) | links: no · buttons and consequential labels: **yes** |
 | `web.type` | Puts text into a field by reference; never submits | no — passwords and credential-shaped text are **refused** |
 | `web.scroll` | Down or up by one screen | no |
 
@@ -80,15 +80,43 @@ from a result it holds, so the five page tools wait up to **11 s inline** (`TASK
 inside the provider's 15 s tool timeout) instead of the 2.5 s other tools get. Without this, live runs
 stopped after the first read.
 
-## Live results (real AssemblyAI voice path, "Open GitHub and check my latest PR.")
+## One tab, one operation at a time
 
-- **Run 3 — completed.** `web.open github.com` → `web.read` (signed in: Dashboard) → `web.click` "All pull
-  requests" → verified navigation to `github.com/pulls/inbox` → `web.read` → *"Your latest pull request is
-  "feat: improve local KFP development workflow" in the kubeflow/kale repository, which was updated last
-  week and is currently awaiting approval."*
-- **Run 4 — safely interrupted.** The user switched Dia to another tab mid-task: the click was refused
-  (*"the browser has moved to a different page"*), the re-read reported the actual page, and Axon said so
-  instead of acting on it.
+The model sometimes sends page calls together (seen live: a read alongside a click). The five page tools
+therefore run **in arrival order** on a per-session queue — a read never races a click. And a page read
+again while its references are still live gets the **same** references, so a redundant read cannot make
+the references the model was just given stale. `web.click` returns the landed page itself, which saves the
+chain a round trip per step.
+
+## Live results (real AssemblyAI voice path, Dia 0.28, 2026-09-30)
+
+**"Open GitHub and check my latest PR."**
+
+- **Final build — opened the PR.** `web.open github.com` → `web.read` (Dashboard, signed in) →
+  `web.click` "All pull requests" (verified navigation to `/pulls/inbox`) → `web.click` the newest PR's
+  title (verified navigation to `github.com/kubeflow/kale/pull/970`, page returned) → *"Your latest pull
+  request is "feat: improve local KFP development workflow" in the kubeflow/kale repository, which is
+  currently awaiting approval."* The page read showed: **Open**, *1 pending check* (tide), *2 pending
+  reviews*, *5 workflows awaiting approval*, *NOT APPROVED* (bot). Axon spoke title, repository and state;
+  it did not read out checks or reviews in that run.
+- **Same line, two other runs on the final build:** the model answered from the list row instead of opening
+  the PR — accurately (title, repository, "awaiting approval", "2/3 checks passing", all visible on the
+  list), but without the PR page. Model behaviour; the PR link was offered as a reference each time.
+- **"Open my latest pull request on GitHub and read its checks."** — opened `pull/970` and said *"…two of
+  the three checks are passing, but one check is still pending."* — matches the list (2/3) and the PR page
+  (1 pending check).
+- **Earlier — safely interrupted.** The user switched Dia to another tab mid-task: the click was refused
+  (*"the browser has moved to a different page"*), and Axon reported the actual page instead of acting.
+- **Found and fixed during these runs:** parallel page calls racing (now queued); a redundant read making
+  fresh references stale (now reused); the model reaching for `browser.click` with a `web.read` reference
+  and then using Axon's own signed-out browser (descriptions now say which browser is which; the model
+  said "please sign in" to GitHub, which was wrong for the user's browser).
+
+**Generic, not GitHub:** *"Open Wikipedia in my browser and open today's featured article."* → `web.open
+wikipedia.org` (Dia) → `web.read` → `web.click` "English" (verified navigation to `en.wikipedia.org/wiki/
+Main_Page`) → `web.read` → *"Today's featured article is about Takato Dam, a gravity dam in Japan."*
+(it answered from the Main Page rather than opening the article). No site-specific code exists for either
+site.
 
 ## Known limitations
 
@@ -100,3 +128,6 @@ stopped after the first read.
 - Chromium-based default browsers (Dia, Chrome, Edge, Brave, Arc) expose pages this way. Firefox exposes
   UIA differently and is untested.
 - Reading a page takes seconds; the model announces slow steps.
+- Right after a Paint drawing (Paint in front), Dia's window did not come forward within `web.open`'s
+  verification window once: Axon said *"I sent GitHub to your browser."* truthfully and stopped. Do the
+  GitHub beat before the Paint beat.

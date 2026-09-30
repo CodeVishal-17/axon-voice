@@ -95,27 +95,63 @@ export class ElectronAppLauncher implements AppLauncher {
  * MEASURED on Electron 44: `writeImage` no longer exists in the main process;
  * `write([new ClipboardItem({ 'image/png': Blob })])` puts PNG, Bitmap and
  * DeviceIndependentBitmap on the Windows clipboard, which is what Paint's
- * Paste reads. `read()` returns items that can be written back as they came,
- * which is how the user's clipboard is restored.
+ * Paste reads.
+ *
+ * ALSO MEASURED, AND WHY `save` COPIES: `write()` REFUSES the very items
+ * `read()` returned ("construct a new ClipboardItem to write"). Writing them
+ * back threw, the throw was swallowed, and a live drawing left Paint's copy
+ * of it on the user's clipboard. So the snapshot holds the data itself, and
+ * restore builds new items from it.
  */
+const STANDARD_CLIPBOARD_TYPES = new Set(['text/plain', 'text/html', 'text/rtf', 'text/uri-list', 'image/png']);
+
+type ClipboardRecord = Record<string, Blob>;
+
 export class ElectronClipboard implements ClipboardImages {
   async save(): Promise<ClipboardSnapshot> {
-    let items: ClipboardItem[] = [];
+    const records: ClipboardRecord[] = [];
     try {
-      items = await clipboard.read();
+      for (const item of await clipboard.read()) {
+        const record: ClipboardRecord = {};
+        for (const type of item.types) {
+          try {
+            record[type] = (await item.getType(type)) as Blob;
+          } catch {
+            // A format Windows would not hand over is one that cannot be restored either.
+          }
+        }
+        if (Object.keys(record).length > 0) records.push(record);
+      }
     } catch {
-      items = [];
+      records.length = 0;
     }
-    return { __clipboardSnapshot: true, items } as ClipboardSnapshot;
+    return { __clipboardSnapshot: true, records } as ClipboardSnapshot;
   }
 
-  async restore(snapshot: ClipboardSnapshot): Promise<void> {
-    const items = (snapshot as unknown as { items?: ClipboardItem[] }).items ?? [];
-    if (items.length === 0) {
+  /**
+   * The clipboard as it was: every format, else the standard ones, else empty.
+   * Never Axon's own content. True only when the user's content is back.
+   */
+  async restore(snapshot: ClipboardSnapshot): Promise<boolean> {
+    const records = (snapshot as unknown as { records?: ClipboardRecord[] }).records ?? [];
+    if (records.length === 0) {
       await clipboard.clear();
-      return;
+      return true;
     }
-    await clipboard.write(items);
+    const standard = records
+      .map((record) => Object.fromEntries(Object.entries(record).filter(([type]) => STANDARD_CLIPBOARD_TYPES.has(type))))
+      .filter((record) => Object.keys(record).length > 0);
+    for (const attempt of [records, standard]) {
+      if (attempt.length === 0) continue;
+      try {
+        await clipboard.write(attempt.map((record) => new ClipboardItem(record)));
+        return true;
+      } catch {
+        // Try fewer formats, then give up and clear.
+      }
+    }
+    await clipboard.clear();
+    return false;
   }
 
   async clear(): Promise<void> {

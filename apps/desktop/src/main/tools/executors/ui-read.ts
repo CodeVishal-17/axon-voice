@@ -47,7 +47,7 @@ import {
   type AppCatalog,
   type DiscoveredApp,
 } from '../../apps/app-catalog.js';
-import { chooseWindow, ownerOf, windowsOf } from '../../apps/window-identity.js';
+import { chooseWindow, ownerOf, windowsOf, withoutNotificationCount } from '../../apps/window-identity.js';
 import { appForWindowTitle } from './app-registry.js';
 import { builtInFor } from './app-launch.js';
 import { refSchema, requireLiveTarget } from './ui-input.js';
@@ -264,7 +264,8 @@ export function createUiReadTool(options: UiReadToolOptions): RegisteredTool {
         read: true,
         observation: observation.id,
         // UNTRUSTED. Written by whichever application owns the window.
-        window: reading.windowTitle,
+        window: withoutNotificationCount(reading.windowTitle ?? '').title || reading.windowTitle,
+        unread: withoutNotificationCount(reading.windowTitle ?? '').unread,
         // Which installed application owns it, as the OS reports — Axon's id and name only.
         application,
         page: input.page,

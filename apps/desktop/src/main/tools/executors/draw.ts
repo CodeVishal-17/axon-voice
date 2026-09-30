@@ -250,35 +250,63 @@ export function createDrawPaintTool(options: DrawPaintToolOptions): RegisteredTo
 
       const act = (name: string, action: 'expand' | 'invoke', runtimeId?: string): Promise<DesktopControlOutcome> =>
         ui.actOnControl({ windowHandle: handle, nativeRole: PAINT_MENU.role, name, automationId: '', action, ...(runtimeId ? { runtimeId } : {}) });
-      const attempt = async (name: string): Promise<boolean> => {
+      // A Paste that does not answer means Paint is stuck in it; pressing again
+      // only queues more work behind it. 'hung' ends the drawing at once.
+      type Press = 'ok' | 'failed' | 'hung';
+      const hung = (outcome: DesktopControlOutcome): boolean => outcome.kind === 'failed' && outcome.reason === 'timeout';
+      const attempt = async (name: string): Promise<Press> => {
         const menu = await act(PAINT_MENU.edit, 'expand', ready.editRuntimeId);
-        if (menu.kind !== 'ok') return false;
+        if (hung(menu)) return 'hung';
+        if (menu.kind !== 'ok') return 'failed';
         let item = await act(name, 'invoke');
-        if (item.kind !== 'ok') {
+        // 'gone': the menu was still opening. Anything else is not retried here.
+        if (item.kind === 'gone') {
           await wait(150);
           item = await act(name, 'invoke');
         }
-        return item.kind === 'ok';
+        if (hung(item)) return 'hung';
+        return item.kind === 'ok' ? 'ok' : 'failed';
       };
-      // MEASURED LIVE: a WinUI menu closes itself the moment its window is not
-      // the active one, so if something else took the foreground mid-drawing
-      // the Paste item is gone before it can be pressed. Once per step, Paint
-      // is brought forward again — the same window action `app.focus` uses —
-      // and the step is retried.
-      const press = async (name: string): Promise<boolean> => {
-        if (await attempt(name)) return true;
-        await desktop.act(handle, 'focus').catch(() => false);
-        await wait(250);
+      // MEASURED LIVE, TWICE OVER. A packaged app like Paint can read the
+      // clipboard only while it is the foreground window: behind another window
+      // its Paste is disabled ("unsupported") or blocks. And a WinUI menu closes
+      // itself the moment its window is not the active one. So Paint must be IN
+      // FRONT — checked from a fresh listing, not assumed from a focus request
+      // Windows may refuse. Axon never forces the foreground.
+      const inFront = async (): Promise<boolean> =>
+        (await desktop.list().catch(() => [] as readonly DesktopWindow[])).some((window) => window.handle === handle && window.foreground);
+      const bringForward = async (): Promise<boolean> => {
+        for (let tries = 0; tries < 3; tries += 1) {
+          if (await inFront()) return true;
+          await desktop.act(handle, 'focus').catch(() => false);
+          await wait(250);
+        }
+        return inFront();
+      };
+      // Checked before the first press (below) and after any press that fails —
+      // a listing costs over a second, so not before every step.
+      const press = async (name: string): Promise<Press> => {
+        const first = await attempt(name);
+        if (first !== 'failed') return first;
+        if (!(await bringForward())) return 'failed';
         return attempt(name);
       };
 
+      // Paint must be able to come to the front before anything is put on the
+      // user's clipboard: if Windows keeps another window there, stop now.
+      if (!(await bringForward())) {
+        throw new ToolError('VERIFICATION_FAILED', 'Paint opened, but Windows kept another window in front of it, so Axon did not draw. Click on Paint and ask again.');
+      }
+
       const saved = await clipboard.save();
       let drawn = 0;
+      let restored = false;
+      let result: JsonObject;
       try {
         ctx.observe(`Drawing ${scene.label}`, { steps: frames.length });
         for (const frame of frames) {
           await clipboard.writePng(frame.png);
-          if (!(await press(PAINT_MENU.paste))) break;
+          if ((await press(PAINT_MENU.paste)) !== 'ok') break;
           drawn += 1;
           ctx.observe(`Drew ${frame.label}`, { step: drawn, of: frames.length });
           await wait(pauseMs);
@@ -290,7 +318,7 @@ export function createDrawPaintTool(options: DrawPaintToolOptions): RegisteredTo
         // VERIFIED FROM PAINT, not from Axon's own record: Paint copies what it
         // has, and that picture is compared with the plan.
         await clipboard.clear();
-        const copied = await press(PAINT_MENU.copyVisible);
+        const copied = (await press(PAINT_MENU.copyVisible)) === 'ok';
         const image = copied ? await clipboard.readImage() : null;
         const match = image ? canvasMatch(scene, image) : { matched: 0, sampled: 0 };
         const stillThere = (await desktop.list().catch(() => [] as readonly DesktopWindow[])).find((window) => window.handle === handle);
@@ -300,7 +328,7 @@ export function createDrawPaintTool(options: DrawPaintToolOptions): RegisteredTo
         }
         ctx.observe(`Paint shows ${scene.label}`, { steps: drawn, matched: match.matched, sampled: match.sampled });
 
-        return {
+        result = {
           drawing: scene.label,
           application: PAINT,
           steps: frames.map((frame) => frame.label),
@@ -315,10 +343,15 @@ export function createDrawPaintTool(options: DrawPaintToolOptions): RegisteredTo
           },
         };
       } finally {
-        // The user's clipboard, as it was. Best effort: a failure here must not
-        // turn a finished drawing into an error.
-        await clipboard.restore(saved).catch(() => undefined);
+        // The user's clipboard, as it was — or, if it cannot be put back, empty.
+        // Never Axon's drawing. A failure here must not turn a finished drawing
+        // into an error, but it is reported rather than swallowed.
+        restored = await clipboard.restore(saved).catch(async () => {
+          await clipboard.clear().catch(() => undefined);
+          return false;
+        });
       }
+      return { ...result, clipboard: restored ? 'restored' : 'emptied: the earlier contents could not be put back' };
     },
   });
 }

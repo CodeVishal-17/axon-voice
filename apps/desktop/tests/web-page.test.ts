@@ -236,10 +236,22 @@ async function harness(options: HarnessOptions = {}) {
   };
 }
 
-type Loose = Record<string, any>;
-const out = (result: ToolResult): Loose => (result.ok ? (result.output as Loose) : {});
+/** The fields of a web tool's output these tests read; what the model sees. */
+interface PageControl { readonly ref: string; readonly role: string; readonly name: string }
+interface WebOutput {
+  readonly title: string;
+  readonly url: string;
+  readonly found: boolean;
+  readonly moreText: boolean;
+  readonly untrustedPageText: string;
+  readonly untrustedMatchingText: string;
+  readonly controls: readonly PageControl[];
+  readonly targets: readonly PageControl[];
+  readonly verified: Readonly<Record<string, unknown>>;
+}
+const out = (result: ToolResult): WebOutput => (result.ok ? result.output : {}) as unknown as WebOutput;
 const kind = (result: ToolResult): string | null => (result.ok ? null : result.failure.kind);
-const refOf = (result: ToolResult, name: string): string => (out(result).controls as Loose[]).find((control) => control.name === name)!.ref as string;
+const refOf = (result: ToolResult, name: string): string => out(result).controls.find((control) => control.name === name)!.ref;
 
 // ---------------------------------------------------------------------------
 // Observation
@@ -253,7 +265,7 @@ describe('web.read — the page in the user\'s own browser', () => {
     const page = out(result);
     expect(page).toMatchObject({ browser: 'Dia', title: 'GitHub', url: 'https://github.com/' });
     expect(page.untrustedPageText).toMatch(/^<<<UNTRUSTED_WEB_CONTENT>>>\n[\s\S]*Top repositories[\s\S]*\n<<<UNTRUSTED_WEB_CONTENT>>>$/);
-    expect(page.controls.map((control: Loose) => control.name)).toContain('Pull requests');
+    expect(page.controls.map((control) => control.name)).toContain('Pull requests');
     for (const control of page.controls) expect(control.ref).toMatch(/^t\d+$/);
   });
 
@@ -305,7 +317,7 @@ describe('web.find', () => {
     const h = await harness();
     const found = out(await h.run('web.find', { text: 'pull requests' }));
     expect(found.found).toBe(true);
-    expect(found.controls.map((control: Loose) => control.name)).toEqual(['Pull requests']);
+    expect(found.controls.map((control) => control.name)).toEqual(['Pull requests']);
     const lines = out(await h.run('web.find', { text: 'repositories' }));
     expect(lines.untrustedMatchingText).toContain('Top repositories');
   });
@@ -316,6 +328,40 @@ describe('web.find', () => {
 // ---------------------------------------------------------------------------
 
 describe('web.click — acting by reference, verified by reading again', () => {
+  it('returns the page a click led to, with fresh references that work for the next click', async () => {
+    const h = await harness();
+    const list = await h.run('web.click', { ref: refOf(await h.run('web.read', {}), 'Pull requests') });
+    const landed = out(list) as WebOutput & { page: WebOutput };
+    expect(landed.page.url).toBe('https://github.com/pulls');
+    expect(landed.page.untrustedPageText).toContain('#42 opened 2 hours ago');
+    expect(JSON.stringify(landed.page)).not.toMatch(/555|100|42\.1\.1|runtimeId|surface/);
+    const pr = await h.run('web.click', { ref: landed.page.controls.find((control) => control.name === 'Add browser control plane')!.ref });
+    expect((out(pr) as WebOutput & { page: WebOutput }).page.untrustedPageText).toContain('All checks have passed');
+  });
+
+  it('keeps references alive when the same page is read again, and only then', async () => {
+    const h = await harness();
+    const list = out(await h.run('web.click', { ref: refOf(await h.run('web.read', {}), 'Pull requests') })) as WebOutput & { page: WebOutput };
+    const again = out(await h.run('web.read', {}));
+    const prRef = list.page.controls.find((control) => control.name === 'Add browser control plane')!.ref;
+    expect(again.controls.map((control) => control.ref)).toContain(prRef);
+    expect((await h.run('web.click', { ref: prRef })).ok).toBe(true);
+    // A different page mints new references; the old ones are refused.
+    const pr = out(await h.run('web.read', {}));
+    expect(pr.controls.map((control) => control.ref)).not.toContain(prRef);
+    expect(kind(await h.run('web.click', { ref: prRef }))).toBe('STALE_REFERENCE');
+  });
+
+  it('takes page calls one at a time, even when the model sends them together', async () => {
+    // Seen live: the model sent a read and a click in the same breath. On one
+    // tab they would race; queued, the read sees the page the click led to.
+    const h = await harness();
+    const ref = refOf(await h.run('web.read', {}), 'Pull requests');
+    const [click, read] = await Promise.all([h.run('web.click', { ref }), h.run('web.read', {})]);
+    expect(click.ok).toBe(true);
+    expect(out(read).url).toBe('https://github.com/pulls');
+  });
+
   it('follows a link without asking, on the page surface, and reports where the browser went', async () => {
     const h = await harness();
     const ref = refOf(await h.run('web.read', {}), 'Pull requests');
@@ -380,7 +426,7 @@ describe('web.click — acting by reference, verified by reading again', () => {
   it('refuses a reference that did not come from a web page', async () => {
     const h = await harness();
     const desktop = await h.run('ui.read', {});
-    const ref = (out(desktop).targets as Loose[])[0]!.ref as string;
+    const ref = out(desktop).targets[0]!.ref;
     expect(kind(await h.run('web.click', { ref }))).toBe('STALE_REFERENCE');
     expect(h.acts).toEqual([]);
   });
@@ -418,7 +464,7 @@ describe('web.scroll', () => {
 // ---------------------------------------------------------------------------
 
 describe('the model has no low-level vocabulary', () => {
-  const invalid: [string, Loose][] = [
+  const invalid: [string, Record<string, unknown>][] = [
     ['web.click', { ref: 't1', x: 400, y: 200 }],
     ['web.click', { ref: 't1', selector: '#submit' }],
     ['web.click', { ref: 't1', nodeId: 42 }],

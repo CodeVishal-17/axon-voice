@@ -383,7 +383,7 @@ export class AxonBrowser implements BrowserController {
 
   private requireWindow(): BrowserWindow {
     if (!this.isOpen()) {
-      throw new BrowserError('NOT_OPEN', 'The browser is not open. Open a page first.');
+      throw new BrowserError('NOT_OPEN', "Axon's own browser is not open. A page in the user's browser is read with web.read.");
     }
     return this.window as BrowserWindow;
   }

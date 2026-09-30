@@ -231,10 +231,13 @@ export function buildScene(key: SceneKey, sky: SkyVariant): Scene {
  * half-state Paint has to merge.
  */
 export function renderFrames(scene: Scene): readonly { readonly label: string; readonly png: Uint8Array }[] {
-  return scene.steps.map((entry, index) => ({
-    label: entry.label,
-    png: renderPng({ ...scene, shapes: scene.steps.slice(0, index + 1).flatMap((part) => part.shapes) }),
-  }));
+  // Incremental: step N is step N-1's pixels with step N's shapes painted over them, which is exactly
+  // the scene cut after step N (shapes only ever paint over earlier ones).
+  const pixels = background(scene);
+  return scene.steps.map((entry) => {
+    paintShapes(pixels, entry.shapes);
+    return { label: entry.label, png: encodePng(pixels) };
+  });
 }
 
 // --- SVG ---------------------------------------------------------------------
@@ -272,16 +275,26 @@ function rgb(hex: string): [number, number, number] {
 
 /** The scene as 8-bit RGB pixels, row by row. Filled at pixel centres; no anti-aliasing. */
 export function rasterize(scene: Scene): Uint8Array {
-  const width = CANVAS_WIDTH;
-  const height = CANVAS_HEIGHT;
-  const pixels = new Uint8Array(width * height * 3);
+  const pixels = background(scene);
+  paintShapes(pixels, scene.shapes);
+  return pixels;
+}
+
+function background(scene: Scene): Uint8Array {
+  const pixels = new Uint8Array(CANVAS_WIDTH * CANVAS_HEIGHT * 3);
   const [br, bg, bb] = rgb(scene.background);
-  for (let index = 0; index < width * height; index += 1) {
+  for (let index = 0; index < CANVAS_WIDTH * CANVAS_HEIGHT; index += 1) {
     pixels[index * 3] = br;
     pixels[index * 3 + 1] = bg;
     pixels[index * 3 + 2] = bb;
   }
+  return pixels;
+}
 
+/** Paints shapes, in order, over pixels already on the canvas. */
+function paintShapes(pixels: Uint8Array, shapes: readonly Shape[]): void {
+  const width = CANVAS_WIDTH;
+  const height = CANVAS_HEIGHT;
   const fill = (x0: number, y0: number, x1: number, y1: number, colour: string, inside: (x: number, y: number) => boolean): void => {
     const [r, g, b] = rgb(colour);
     const left = Math.max(0, Math.floor(x0));
@@ -299,7 +312,7 @@ export function rasterize(scene: Scene): Uint8Array {
     }
   };
 
-  for (const shape of scene.shapes) {
+  for (const shape of shapes) {
     switch (shape.kind) {
       case 'rect':
         fill(shape.x, shape.y, shape.x + shape.w, shape.y + shape.h, shape.fill, (x, y) => x >= shape.x && x < shape.x + shape.w && y >= shape.y && y < shape.y + shape.h);
@@ -331,7 +344,6 @@ export function rasterize(scene: Scene): Uint8Array {
       }
     }
   }
-  return pixels;
 }
 
 function insidePolygon(points: readonly (readonly [number, number])[], x: number, y: number): boolean {
@@ -383,7 +395,10 @@ export const PNG_SIGNATURE = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 /** The scene as a PNG file's bytes. Deterministic: the same scene is the same bytes. */
 export function renderPng(scene: Scene): Uint8Array {
-  const pixels = rasterize(scene);
+  return encodePng(rasterize(scene));
+}
+
+function encodePng(pixels: Uint8Array): Uint8Array {
   const stride = CANVAS_WIDTH * 3;
   const raw = Buffer.alloc((stride + 1) * CANVAS_HEIGHT);
   for (let y = 0; y < CANVAS_HEIGHT; y += 1) {
@@ -396,7 +411,7 @@ export function renderPng(scene: Scene): Uint8Array {
   header[8] = 8; // bit depth
   header[9] = 2; // colour type: RGB
   return new Uint8Array(
-    Buffer.concat([Buffer.from(PNG_SIGNATURE), chunk('IHDR', header), chunk('IDAT', deflateSync(raw, { level: 9 })), chunk('IEND', new Uint8Array(0))]),
+    Buffer.concat([Buffer.from(PNG_SIGNATURE), chunk('IHDR', header), chunk('IDAT', deflateSync(raw, { level: 6 })), chunk('IEND', new Uint8Array(0))]),
   );
 }
 

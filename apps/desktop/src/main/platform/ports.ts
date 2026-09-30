@@ -39,7 +39,12 @@ export interface AppLauncher {
  */
 export interface ClipboardImages {
   save(): Promise<ClipboardSnapshot>;
-  restore(snapshot: ClipboardSnapshot): Promise<void>;
+  /**
+   * Puts the saved content back. True when it is back; false when it could
+   * not be, in which case the clipboard is left EMPTY — never holding Axon's
+   * own content. Throws only if even clearing failed.
+   */
+  restore(snapshot: ClipboardSnapshot): Promise<boolean>;
   clear(): Promise<void>;
   writePng(png: Uint8Array): Promise<void>;
   /** The image on the clipboard, as RGBA pixels, or null when there is none. */

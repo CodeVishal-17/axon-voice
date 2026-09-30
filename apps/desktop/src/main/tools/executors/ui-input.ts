@@ -219,7 +219,46 @@ function describeOutcome(outcome: Exclude<DesktopControlOutcome, { kind: 'ok' }>
  * say "the file was saved", and pretending otherwise is the invented success
  * this whole layer exists to prevent.
  */
+type Verification = ScreenChangeVerification & { readonly appeared: readonly string[] };
+
+/**
+ * What newly appeared on screen, by label: the EVIDENCE of what an act did.
+ * MEASURED LIVE on Spotify: pressing Play also closes the search suggestions,
+ * so "the controls changed" is true whether or not anything played. What
+ * shows it did is a label that was not there before — "Now playing: Blinding
+ * Lights by The Weeknd". Untrusted text, bounded; the model reads it.
+ */
 function verifyScreenChange(
+  before: readonly ScreenTarget[],
+  beforeWindow: string,
+  after: DesktopScreenReading,
+  expectedText: string | null,
+  appliedValue: string | null,
+): Verification {
+  const seen = new Set(before.map((target) => target.name));
+  const appeared = after.available
+    ? [...new Set(after.controls.map((control) => control.name).filter((name) => name.trim() !== '' && !seen.has(name)))]
+        .slice(0, 8)
+        .map((name) => name.slice(0, 100))
+    : [];
+  const base = screenChange(before, beforeWindow, after, expectedText, appliedValue);
+  // MEASURED LIVE: Spotify's search box reads back empty after text is set,
+  // while its results appear at once. The read-back failing is still said
+  // (textApplied stays false); what appeared is the evidence the typing landed.
+  if (base.textApplied === false && base.targetsChanged && appeared.length > 0) {
+    return {
+      ...base,
+      changed: true,
+      appeared,
+      summary:
+        'The field does not read the text back (some search boxes do not), but new items appeared on screen right after ' +
+        'typing — see newlyOnScreen. Look at the screen again before acting on them.',
+    };
+  }
+  return { ...base, appeared };
+}
+
+function screenChange(
   before: readonly ScreenTarget[],
   beforeWindow: string,
   after: DesktopScreenReading,
@@ -293,7 +332,7 @@ function verifyScreenChange(
  * model is told to look again, which is one call and is how it gets a picture
  * of what its own action did.
  */
-function actionOutput(verification: ScreenChangeVerification, windowNow: string): JsonObject {
+function actionOutput(verification: Verification, windowNow: string): JsonObject {
   return {
     verified: {
       changed: verification.changed,
@@ -301,6 +340,9 @@ function actionOutput(verification: ScreenChangeVerification, windowNow: string)
       targetsChanged: verification.targetsChanged,
       textApplied: verification.textApplied,
       summary: verification.summary,
+      // UNTRUSTED: labels the application wrote. Evidence of what the act did —
+      // e.g. a "Now playing" label — or of nothing, when it is empty.
+      newlyOnScreen: [...verification.appeared],
     },
     windowInFront: windowNow,
     note:

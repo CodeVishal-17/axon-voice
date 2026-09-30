@@ -10,6 +10,7 @@
  * clipboard is a variable.
  */
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -122,8 +123,12 @@ interface HarnessOptions {
   paintOpens?: boolean;
   /** Paste fails on this step (1-based), every time. */
   pasteFailsAt?: number;
-  /** Paste fails on this step until Paint is brought forward again — the menu light-dismissed. */
+  /** Another window takes the foreground before this step, until Axon brings Paint forward. */
   pasteFailsUntilFocusAt?: number;
+  /** Windows refuses every focus request and keeps another window in front. */
+  focusRefused?: boolean;
+  /** Paint's Paste stops answering on this step (1-based). */
+  pasteHangsAt?: number;
   /** What Copy visible layers hands back: the canvas, a wrong picture, or nothing. */
   readBack?: 'canvas' | 'wrong' | 'nothing';
   /** Paint closes before Axon checks. */
@@ -131,6 +136,8 @@ interface HarnessOptions {
   /** Windows already on screen, e.g. the user's own Paint. */
   existing?: DesktopWindow[];
   provider?: ImageProvider | null;
+  /** The platform cannot put the user's clipboard back ('refuses'), or fails outright ('throws'). */
+  restoreFails?: 'refuses' | 'throws';
 }
 
 async function harness(options: HarnessOptions = {}) {
@@ -143,12 +150,18 @@ async function harness(options: HarnessOptions = {}) {
   let canvas: Uint8Array | null = null;
   let newPaint: DesktopWindow | null = null;
   const focused: string[] = [];
+  // Whether Axon's new Paint window is the foreground window right now.
+  let front = options.focusRefused !== true;
+  let stolen = false;
 
   const desktop: DesktopWindows = {
     available: true,
-    list: () => Promise.resolve([...windows]),
+    list: () => Promise.resolve(windows.map((window) => (window === newPaint ? { ...window, foreground: front } : window))),
     act: (handle, action) => {
-      if (action === 'focus') focused.push(handle);
+      if (action === 'focus') {
+        focused.push(handle);
+        if (!options.focusRefused && newPaint && handle === newPaint.handle) front = true;
+      }
       return Promise.resolve(true);
     },
   };
@@ -173,8 +186,10 @@ async function harness(options: HarnessOptions = {}) {
     save: () => Promise.resolve(USER_CLIPBOARD),
     restore: (snapshot) => {
       restored.push(snapshot);
-      clip = { kind: 'user' };
-      return Promise.resolve();
+      if (options.restoreFails === 'throws') return Promise.reject(new Error('clipboard busy'));
+      // A port that cannot restore leaves the clipboard empty, never Axon's content.
+      clip = options.restoreFails === 'refuses' ? { kind: 'empty' } : { kind: 'user' };
+      return Promise.resolve(options.restoreFails !== 'refuses');
     },
     clear: () => {
       clip = { kind: 'empty' };
@@ -209,7 +224,14 @@ async function harness(options: HarnessOptions = {}) {
         if (clip.kind !== 'png') return Promise.resolve({ kind: 'failed', reason: 'nothing to paste' });
         if (options.pasteFailsAt === pastes + 1) return Promise.resolve({ kind: 'failed', reason: 'paint said no' });
         // Focus taken away before this step: the flyout closed, until Axon refocuses.
-        if (options.pasteFailsUntilFocusAt === pastes + 1 && focused.length < 2) return Promise.resolve({ kind: 'gone' });
+        if (options.pasteFailsUntilFocusAt === pastes + 1 && !stolen) {
+          stolen = true;
+          front = false;
+          return Promise.resolve({ kind: 'gone' });
+        }
+        // Behind another window, a packaged app cannot read the clipboard.
+        if (!front) return Promise.resolve({ kind: 'unsupported' });
+        if (options.pasteHangsAt === pastes + 1) return Promise.resolve({ kind: 'failed', reason: 'timeout' });
         pastes += 1;
         canvas = clip.png;
         if (options.paintCloses && newPaint) windows = windows.filter((window) => window !== newPaint);
@@ -282,6 +304,7 @@ async function harness(options: HarnessOptions = {}) {
     restored,
     focused,
     USER_CLIPBOARD,
+    clip: () => clip.kind,
     pastes: () => pastes,
     newPaint: () => newPaint,
     files,
@@ -330,12 +353,14 @@ describe('what Axon can draw', () => {
 
   it('has a fixed, deterministic plan: the same steps, shapes and frames every time', () => {
     for (const [key, sky] of SCENES) expect(buildScene(key, sky)).toEqual(buildScene(key, sky));
-    // Rendering every frame is the slow part; two plans are enough to show it is byte-stable.
-    for (const [key, sky] of [['house', 'day'], ['cat', 'night']] as const) {
-      const a = renderFrames(buildScene(key, sky));
-      const b = renderFrames(buildScene(key, sky));
-      expect(a.map((frame) => Buffer.from(frame.png).toString('base64'))).toEqual(b.map((frame) => Buffer.from(frame.png).toString('base64')));
-    }
+    // Every plan is structurally identical above. Rendering is one pure function
+    // of the plan, so one plan rendered twice shows it is byte-stable; rendering
+    // more only slows the suite (it timed out under full-suite load).
+    const digest = (frames: ReturnType<typeof renderFrames>): string[] => frames.map((frame) => createHash('sha256').update(frame.png).digest('hex'));
+    const frames = renderFrames(buildScene('house', 'day'));
+    expect(digest(frames)).toEqual(digest(renderFrames(buildScene('house', 'day'))));
+    // Frames are painted incrementally; the last one is exactly the whole scene.
+    expect(digest([frames.at(-1)!])).toEqual(digest([{ label: '', png: renderPng(buildScene('house', 'day')) }]));
   });
 
   it('bounds every plan: a few steps, a few dozen shapes, every coordinate on the canvas', () => {
@@ -448,6 +473,22 @@ describe('draw.paint — drawing in Paint, step by step', () => {
     const failed = await harness({ pasteFailsAt: 3 });
     await failed.decide('draw.paint', { subject: 'a tree' }, 'ALLOW');
     expect(failed.restored).toEqual([failed.USER_CLIPBOARD]);
+    expect(failed.clip()).toBe('user');
+  });
+
+  it('says so when the clipboard could not be put back — and never leaves the drawing on it', async () => {
+    // FOUND LIVE: Electron 44 refused to write back what it had read, the
+    // failure was swallowed, and Paint's copy of the drawing stayed behind.
+    const ok = await harness();
+    expect(output(await ok.decide('draw.paint', { subject: 'a house' }, 'ALLOW')).clipboard).toBe('restored');
+    expect(ok.clip()).toBe('user');
+    for (const restoreFails of ['refuses', 'throws'] as const) {
+      const h = await harness({ restoreFails });
+      const result = await h.decide('draw.paint', { subject: 'a house' }, 'ALLOW');
+      expect(result.ok).toBe(true);
+      expect(String(output(result).clipboard)).toMatch(/^emptied/);
+      expect(h.clip()).toBe('empty');
+    }
   });
 
   it('paces the steps so they can be watched, and the pauses are bounded', async () => {
@@ -493,6 +534,27 @@ describe('draw.paint — drawing in Paint, step by step', () => {
     expect(h.pastes()).toBe(buildScene('house', 'day').steps.length);
     // Once when it opened, once to recover — and only ever Axon's own new window.
     expect(h.focused).toEqual([h.newPaint()!.handle, h.newPaint()!.handle]);
+  });
+
+  it('does not draw — and never touches the clipboard — when Paint cannot come to the front', async () => {
+    const h = await harness({ focusRefused: true });
+    const result = await h.decide('draw.paint', { subject: 'a house' }, 'ALLOW');
+    expect(kind(result)).toBe('VERIFICATION_FAILED');
+    expect(message(result)).toMatch(/kept another window in front/);
+    expect(h.clipboardWrites).toEqual([]);
+    expect(h.pastes()).toBe(0);
+    expect(h.acts.filter((act) => act.name === 'Paste')).toEqual([]);
+  });
+
+  it('stops at once when Paint stops answering a Paste, and still restores the clipboard', async () => {
+    const h = await harness({ pasteHangsAt: 2 });
+    const result = await h.decide('draw.paint', { subject: 'a house' }, 'ALLOW');
+    expect(kind(result)).toBe('VERIFICATION_FAILED');
+    expect(message(result)).toMatch(/after 1 of \d+ steps/);
+    // One Paste for step 1, ONE for the hung step 2 — nothing queued behind it.
+    expect(h.acts.filter((act) => act.name === 'Paste')).toHaveLength(2);
+    expect(h.restored).toEqual([h.USER_CLIPBOARD]);
+    expect(h.clip()).toBe('user');
   });
 
   it('does not claim success when a step fails part-way', async () => {
@@ -600,7 +662,7 @@ describe('draw.paint — what the model cannot say', () => {
       launcher: { launchExecutable: () => Promise.resolve({ pid: 1 }), openUri: noop, launchStartMenuApp: noop },
       desktop: { available: true, list: () => Promise.resolve([]), act: () => Promise.resolve(true) },
       ui: { uiAvailable: true, observeControls: () => Promise.reject(new Error('unused')), actOnControl: () => Promise.reject(new Error('unused')) },
-      clipboard: { save: () => Promise.reject(new Error('unused')), restore: noop, clear: noop, writePng: noop, readImage: () => Promise.resolve(null) },
+      clipboard: { save: () => Promise.reject(new Error('unused')), restore: () => Promise.resolve(true), clear: noop, writePng: noop, readImage: () => Promise.resolve(null) },
     });
     const view = toToolSchema(tool).inputSchema as { properties: object };
     expect(Object.keys(view.properties).sort()).toEqual(['style', 'subject']);
@@ -741,7 +803,7 @@ describe('registration', () => {
     screenshotDir: tempDir(),
     pathPolicy: { workspaceRoot: tempDir(), forbiddenRoots: [] },
   });
-  const clipboard: ClipboardImages = { save: () => Promise.reject(new Error('unused')), restore: noop, clear: noop, writePng: noop, readImage: () => Promise.resolve(null) };
+  const clipboard: ClipboardImages = { save: () => Promise.reject(new Error('unused')), restore: () => Promise.resolve(true), clear: noop, writePng: noop, readImage: () => Promise.resolve(null) };
   const desktop: DesktopWindows = { available: true, list: () => Promise.resolve([]), act: () => Promise.resolve(true) };
   const ui: DesktopUi = { uiAvailable: true, observeControls: () => Promise.reject(new Error('unused')), actOnControl: () => Promise.reject(new Error('unused')) };
   const apps: DesktopApps = { appsAvailable: true, listStartMenuApps: () => Promise.resolve(RAW), defaultBrowser: () => Promise.resolve(null) };

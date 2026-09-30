@@ -1722,10 +1722,35 @@ describe('SECURITY: there is no arbitrary command execution', () => {
     expect(engine).not.toMatch(/GetTypeFromProgID|Type\.GetType\(|Assembly\.Load|LoadLibrary|LoadFrom|Activator\.CreateInstance\((?!Type\.GetTypeFromCLSID\(new Guid\(CUIAutomation\)\))/);
     // No process, no file, no network, no registry, no reflection-driven invocation.
     expect(engine).not.toMatch(/Process\.Start|System\.IO\.File|System\.Net|Registry|InvokeMember|Reflection/);
-    // Its one native import is the foreground-window query; no input synthesis, no process access.
-    expect([...engine.matchAll(/DllImport\("([^"]+)"\)\] static extern \w+ (\w+)/g)].map((match) => `${match[1]}:${match[2]}`)).toEqual([
+    // Its native imports, EVERY one of them whatever attributes it carries: the
+    // foreground-window query, and the child-window listing the browser needs.
+    // No input synthesis, no process access.
+    expect([...engine.matchAll(/DllImport\("([^"]+)"[^\]]*\)\] static extern \w+ (\w+)/g)].map((match) => `${match[1]}:${match[2]}`)).toEqual([
       'user32.dll:GetForegroundWindow',
+      'user32.dll:EnumChildWindows',
+      'user32.dll:GetClassName',
     ]);
+    expect([...engine.matchAll(/DllImport\(/g)]).toHaveLength(3);
+    // WHY THE CHILD-WINDOW LISTING EXISTS, AND WHY IT IS NOT WINDOW CONTROL.
+    // Chromium browsers (Dia on the reference machine) often expose the web
+    // page to UI Automation only beneath their render widget — a child window
+    // of class `Chrome_RenderWidgetHostHWND` — and not beneath the top-level
+    // window a user sees. Reading the user's real browser needs that one
+    // child. So the listing is fenced as tightly as it can be:
+    //   · it lists children of a window the host already chose (the default
+    //     browser's own window, found by package — never a model argument);
+    //   · it keeps only windows of ONE constant class name, compared exactly;
+    //   · its only caller is the read-only `page` op, which returns a handle to
+    //     the TypeScript host and never to the model (parsePage, the web tools'
+    //     output and the schema tests hold that line);
+    //   · it reads class names, nothing more: no messages sent, no process
+    //     opened, no window moved, shown, focused or closed.
+    expect([...engine.matchAll(/EnumChildWindows\(/g)]).toHaveLength(2); // declaration + one use
+    expect([...engine.matchAll(/GetClassName\(/g)]).toHaveLength(2);
+    expect([...engine.matchAll(/"Chrome_RenderWidgetHostHWND"/g)]).toHaveLength(1);
+    expect(engine).toMatch(/c\.ToString\(\) == "Chrome_RenderWidgetHostHWND"/);
+    expect([...engine.matchAll(/\bSurfaces\(/g)]).toHaveLength(2); // definition + the page op
+    expect(engine).not.toMatch(/SendMessage|PostMessage|SetWindowPos|ShowWindow|SetForegroundWindow|DestroyWindow|GetWindowThreadProcessId|FindWindow/);
     expect(engine).not.toMatch(/SendInput|SetCursorPos|keybd_event|mouse_event|OpenProcess|ReadProcessMemory|CreateRemoteThread/);
     // It travels on a command line: bounded well under Windows' 32,767 characters.
     expect(engine.length).toBeLessThan(30_000);

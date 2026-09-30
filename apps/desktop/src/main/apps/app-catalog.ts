@@ -26,6 +26,7 @@
  */
 
 import type { DefaultBrowser, RawStartMenuApp } from '../platform/windows-desktop.js';
+import { withoutNotificationCount } from './window-identity.js';
 
 /** How an entry is started, which is also how it is described to a person. */
 export type AppKind = 'packaged' | 'registered' | 'program';
@@ -330,6 +331,13 @@ export type Resolution =
  * picking one would be Axon deciding for the user. None anywhere is NONE.
  */
 export function resolveApp(catalog: readonly DiscoveredApp[], request: string): Resolution {
+  const exact = resolveName(catalog, request);
+  // "WhatsApp (7)" — a window title's unread count — names WhatsApp.
+  const bare = withoutNotificationCount(request.trim());
+  return exact.kind === 'none' && bare.unread !== null ? resolveName(catalog, bare.title) : exact;
+}
+
+function resolveName(catalog: readonly DiscoveredApp[], request: string): Resolution {
   const trimmed = request.trim();
   if (/^app_[0-9a-f]{10}$/.test(trimmed)) {
     const app = catalog.find((entry) => entry.id === trimmed);

@@ -48,6 +48,7 @@ import {
   type ScreenTarget,
   type SideEffectClass,
   type TargetAction,
+  type ToolExecutionContext,
   type ToolSummary,
 } from '@axon/core';
 import type { DesktopApps, DesktopScreenReading, DesktopUi, DesktopWindow, DesktopWindows, WebPageReading } from '../../platform/windows-desktop.js';
@@ -107,6 +108,22 @@ class WebSession {
     return (this.options.now ?? Date.now)();
   }
 
+  private queue: Promise<unknown> = Promise.resolve();
+  /** The last first-part read of a page, so an identical re-read keeps its references. */
+  private last: { url: string; text: string | null; targets: readonly ScreenTarget[]; hasMore: boolean; reading: DesktopScreenReading } | null = null;
+
+  /**
+   * One page operation at a time. There is one tab in front and one page on it:
+   * a read racing a click reads a page that is being replaced, and two clicks
+   * race each other. The model can and does issue page calls in parallel (seen
+   * live), so they are taken in arrival order here instead of trusted not to.
+   */
+  exclusive<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(work, work);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
   wait(ms: number): Promise<void> {
     return (this.options.wait ?? ((delay: number) => new Promise<void>((resolve) => setTimeout(resolve, delay))))(ms);
   }
@@ -161,6 +178,21 @@ class WebSession {
 
   /** One page of the page's own controls, minted into the shared store. Never the browser's sidebar. */
   async controls(open: OpenPage, part: number): Promise<{ targets: readonly ScreenTarget[]; hasMore: boolean; reading: DesktopScreenReading }> {
+    // The same page read again while its references are still live gets the
+    // SAME references. Minting new ones would supersede the ones the model was
+    // just given (seen live: a read sent alongside a click made the click's
+    // fresh references stale before they could be used).
+    const last = this.last;
+    if (
+      part === 1 &&
+      last &&
+      last.url === open.page.url &&
+      last.text === open.page.text &&
+      last.targets.length > 0 &&
+      last.targets.every((target) => this.options.store.resolve(target.ref).ok)
+    ) {
+      return { targets: last.targets, hasMore: last.hasMore, reading: last.reading };
+    }
     const { identity } = open.page;
     // Chromium's render surface holds only the page; the browser window also
     // holds its sidebar, so there the read is scoped to the page's Document.
@@ -177,7 +209,9 @@ class WebSession {
     const observation = extended?.observation ?? store.record(null, reading);
     const targets = extended?.added ?? observation.targets;
     for (const target of targets) this.refs.set(target.ref, open.page.url);
-    return { targets, hasMore: reading.hasMore === true, reading };
+    const hasMore = reading.hasMore === true;
+    this.last = part === 1 ? { url: open.page.url, text: open.page.text, targets, hasMore, reading } : null;
+    return { targets, hasMore, reading };
   }
 
   /**
@@ -258,6 +292,24 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
     return { ok: true, target: resolved.target, url };
   };
 
+  /** One part of the page on screen, as the model sees it: facts, fenced text, fresh references. */
+  const pageView = async (open: OpenPage, part: number, ctx: ToolExecutionContext): Promise<JsonObject> => {
+    const text = open.page.text ?? '';
+    const chunk = text.slice((part - 1) * TEXT_PART_CHARS, part * TEXT_PART_CHARS);
+    const { targets, hasMore } = await session.controls(open, part);
+    ctx.observe(`Read ${hostOf(open.page.url)} (part ${part})`, { controls: targets.length, textChars: chunk.length });
+    return {
+      ...pageFacts(open),
+      part,
+      untrustedPageText: fence(chunk),
+      moreText: text.length > part * TEXT_PART_CHARS,
+      controls: project(targets),
+      moreControls: hasMore,
+      referencesValidForSeconds: Math.round(OBSERVATION_LIMITS.targetTtlMs / 1000),
+      note: UNTRUSTED_NOTE,
+    };
+  };
+
   const act = async (ref: string, action: TargetAction, text?: string): Promise<{ outcome: Awaited<ReturnType<DesktopUi['actOnControl']>>; open: OpenPage }> => {
     const resolved = store.resolve(ref);
     if (!resolved.ok) throw new ToolError('STALE_REFERENCE', 'The page changed before Axon could act. Read it again.');
@@ -299,29 +351,17 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
       'Read the web page open in the user\'s OWN default browser: its title, its address, its text, and its links, buttons and ' +
       'fields as references (t12) you can pass to web.click or web.type. Text and controls come in parts; ask for the next part ' +
       'when the result says there is more. Only the tab in front is readable, and only what is on screen is listed as a control: ' +
-      'use web.scroll to see further. Call it after web.open, and again after every click.',
+      'use web.scroll to see further. Call it after web.open (web.click already returns the page it led to). A list shows rows, not the ' +
+      'items: to check one item, web.click its link and read ITS page before answering.',
     inputSchema: readSchema,
     resolveRisk: (): RiskAssessment => ({ level: 'SAFE', reason: 'Reading a page changes nothing.' }),
     summarize: (): ToolSummary => ({ title: 'Axon wants to read the page in your browser', parameters: [] }),
     sideEffect: (): SideEffectClass => 'NONE',
-    async execute(input, ctx): Promise<JsonObject> {
+    execute: (input, ctx): Promise<JsonObject> =>
+      session.exclusive(async (): Promise<JsonObject> => {
       const open = await session.open();
-      const text = open.page.text ?? '';
-      const chunk = text.slice((input.part - 1) * TEXT_PART_CHARS, input.part * TEXT_PART_CHARS);
-      const { targets, hasMore } = await session.controls(open, input.part);
-      ctx.observe(`Read ${hostOf(open.page.url)} (part ${input.part})`, { controls: targets.length, textChars: chunk.length });
-      return {
-        read: true,
-        ...pageFacts(open),
-        part: input.part,
-        untrustedPageText: fence(chunk),
-        moreText: text.length > input.part * TEXT_PART_CHARS,
-        controls: project(targets),
-        moreControls: hasMore,
-        referencesValidForSeconds: Math.round(OBSERVATION_LIMITS.targetTtlMs / 1000),
-        note: UNTRUSTED_NOTE,
-      };
-    },
+      return { read: true, ...(await pageView(open, input.part, ctx)) };
+    }),
   });
 
   // --- web.find -------------------------------------------------------------
@@ -337,7 +377,8 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
     resolveRisk: (): RiskAssessment => ({ level: 'SAFE', reason: 'Searching a page changes nothing.' }),
     summarize: (input): ToolSummary => ({ title: 'Axon wants to search the page in your browser', parameters: [{ label: 'Looking for', value: input.text }] }),
     sideEffect: (): SideEffectClass => 'NONE',
-    async execute(input, ctx): Promise<JsonObject> {
+    execute: (input, ctx): Promise<JsonObject> =>
+      session.exclusive(async (): Promise<JsonObject> => {
       const open = await session.open();
       const needle = input.text.toLowerCase();
       const lines = (open.page.text ?? '')
@@ -360,7 +401,7 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
         found: found.length > 0 || lines.length > 0,
         note: UNTRUSTED_NOTE + ' Only controls on screen are searched: web.scroll, then search again, to look further down.',
       };
-    },
+    }),
   });
 
   // --- web.click ------------------------------------------------------------
@@ -372,7 +413,8 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
     description:
       'Click a link, tab, row or button on the page in the user\'s browser, by a reference from web.read or web.find. Links and ' +
       'tabs just go there; a button, or anything that sends, submits, buys or deletes, asks the user first. The result says what ' +
-      'actually changed. Read the page again before the next click.',
+      'actually changed and, when the page changed, includes the new page with fresh references — no need to read it again. ' +
+      'Use it to open the one item the user asked about.',
     inputSchema: clickSchema,
     precheck(input): PrecheckVerdict {
       const found = webTarget(input.ref);
@@ -401,7 +443,8 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
       const found = webTarget(input.ref);
       return found.ok && NAVIGATING_ROLES.has(found.target.role) ? 'NONE' : 'EXTERNAL';
     },
-    async execute(input, ctx): Promise<JsonObject> {
+    execute: (input, ctx): Promise<JsonObject> =>
+      session.exclusive(async (): Promise<JsonObject> => {
       const found = webTarget(input.ref);
       if (!found.ok) throw new ToolError('STALE_REFERENCE', found.verdict.ok ? 'Read the page again.' : found.verdict.reason);
       const action = pressAction(found.target);
@@ -413,6 +456,10 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
       if (after.page && !isNavigable(after.page.url)) {
         return { clicked: true, verified: { changed: true, navigated: true, summary: 'The page went to a local or private address, which Axon does not read.' } };
       }
+      // The page the click led to, read once here: the model's next step needs
+      // it, and a separate web.read would cost the chain a whole round trip.
+      const landed = after.changed ? await session.open().catch(() => null) : null;
+      const view = landed && isNavigable(landed.page.url) ? await pageView(landed, 1, ctx) : null;
       return {
         clicked: true,
         clickedName: found.target.name,
@@ -422,14 +469,15 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
           // UNTRUSTED: written by the site.
           title: after.page?.title ?? null,
           url: after.page?.url ?? null,
-          summary: after.navigated
-            ? `The browser is now on ${hostOf(after.page!.url)}. Read it with web.read.`
-            : after.changed
-              ? 'The page changed. Read it with web.read.'
-              : 'Nothing on the page changed that Axon could see. Do not say it worked.',
+          summary: !after.changed
+            ? 'Nothing on the page changed that Axon could see. Do not say it worked.'
+            : view
+              ? `The browser is now on ${hostOf(landed!.page.url)}; the page is below — no need to read it again.`
+              : 'The page changed. Read it with web.read.',
         },
+        ...(view ? { page: view } : {}),
       };
-    },
+    }),
   });
 
   // --- web.type -------------------------------------------------------------
@@ -465,7 +513,8 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
       };
     },
     sideEffect: (): SideEffectClass => 'LOCAL',
-    async execute(input, ctx): Promise<JsonObject> {
+    execute: (input, ctx): Promise<JsonObject> =>
+      session.exclusive(async (): Promise<JsonObject> => {
       if (classifyText(input.text).sensitivity === 'SECRET') throw new ToolError('FORBIDDEN', 'Credential-shaped text is never typed.');
       const found = webTarget(input.ref);
       if (!found.ok) throw new ToolError('STALE_REFERENCE', 'Read the page again.');
@@ -478,7 +527,7 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
         field: found.target.name,
         verified: { valueMatches: matches, summary: matches ? 'The field now holds that text.' : 'The field reports different text than was typed.' },
       };
-    },
+    }),
   });
 
   // --- web.scroll -----------------------------------------------------------
@@ -492,7 +541,8 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
     resolveRisk: (): RiskAssessment => ({ level: 'SAFE', reason: 'Scrolling changes only what is visible.' }),
     summarize: (input): ToolSummary => ({ title: `Axon wants to scroll the page ${input.direction}`, parameters: [] }),
     sideEffect: (): SideEffectClass => 'NONE',
-    async execute(input, ctx): Promise<JsonObject> {
+    execute: (input, ctx): Promise<JsonObject> =>
+      session.exclusive(async (): Promise<JsonObject> => {
       const open = await session.open();
       const outcome = await ui.scrollPage(open.page.surface, open.page.identity, input.direction);
       if (outcome.kind !== 'ok') throw refused(outcome.kind === 'failed' ? 'failed' : outcome.kind);
@@ -510,7 +560,7 @@ export function createWebPageTools(options: WebPageToolOptions): readonly Regist
           summary: position === null ? 'This page does not report a scroll position. Read it again to see what is on screen.' : moved ? `Now ${position}% down the page. Read it again.` : 'The page did not move — it may already be at that end.',
         },
       };
-    },
+    }),
   });
 
   return [webRead, webFind, webClick, webType, webScroll];

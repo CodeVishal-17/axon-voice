@@ -579,6 +579,17 @@ describe('the spotter protocol, against a stand-in child', () => {
 
   const settle = (ms = 1_500): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+  /**
+   * Waits for what the test is actually about, bounded, instead of a fixed
+   * sleep: a child process's start-up time is the machine's, and under a full
+   * parallel suite it is several times what it is alone. A fixed window that
+   * fits the quiet case fails the loaded one (measured: both tests below).
+   */
+  async function until(condition: () => boolean, limitMs: number): Promise<void> {
+    const deadline = Date.now() + limitMs;
+    while (!condition() && Date.now() < deadline) await settle(25);
+  }
+
   it('reads READY and WAKE, and carries the timing through', async () => {
     const engine = speaking(
       "process.stdout.write('READY 1.13.8 0.10\\n');" +
@@ -644,24 +655,26 @@ describe('the spotter protocol, against a stand-in child', () => {
       clearTimer: () => undefined,
     });
     const seen = listen(engine);
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      await settle(150);
-      const next = pending.shift();
-      if (next) next();
+    // Each round: wait for the child to die and a restart to be scheduled,
+    // then fire it by hand. The bound on rounds is the assertion's teeth: a
+    // respawn-forever engine would never report a failure within them.
+    for (let round = 0; round < 12 && seen.failures.length === 0; round += 1) {
+      await until(() => pending.length > 0 || seen.failures.length > 0, 5_000);
+      pending.shift()?.();
     }
     engine.stop();
     expect(seen.failures.length).toBeGreaterThan(0);
     expect(seen.failures[0]).toMatch(/could not keep the wake-word engine running/);
-  });
+  }, 30_000);
 
   it('reports an ERR line as a diagnostic without taking Axon down for it', async () => {
     const engine = speaking("process.stdout.write('ERR MODEL the wake model would not load\\n'); setTimeout(() => {}, 3000);");
     const seen = listen(engine);
-    await settle();
+    await until(() => seen.debug.some((line) => /MODEL/.test(line)), 8_000);
     engine.stop();
     expect(seen.debug.join('\n')).toMatch(/MODEL/);
     expect(seen.failures).toEqual([]);
-  });
+  }, 15_000);
 
   it('is unavailable, with an actionable reason, when the model is not installed', () => {
     const engine = new SherpaKeywordEngine({ threshold: 0.1, modelDir: path.join(HERE, 'no-such-model') });

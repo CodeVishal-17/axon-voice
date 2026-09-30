@@ -154,7 +154,7 @@ namespace AxonUia {
     delegate bool ChildProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, ChildProc f, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
-    // Chromium's page surfaces inside a browser window: where its page accessibility lives when the shell does not parent it.
+    // Chromium's render surfaces: where a browser's page is exposed when its window does not parent it.
     static List<long> Surfaces(long hwnd) {
       var r = new List<long>();
       EnumChildWindows(new IntPtr(hwnd), (h, l) => { var c = new System.Text.StringBuilder(64); GetClassName(h, c, 64); if (c.ToString() == "Chrome_RenderWidgetHostHWND") r.Add(h.ToInt64()); return true; }, IntPtr.Zero);
@@ -195,11 +195,8 @@ namespace AxonUia {
     static string Text(IUIAutomationElement e, int id) { object v = Cached(e, id); return v as string ?? ""; }
     static int TypeOf(IUIAutomationElement e) { object v = Cached(e, P_Type); return v is int ? (int)v : 0; }
     static string NativeRole(int type) { string n; return Names.TryGetValue(type, out n) ? "ControlType." + n : ""; }
-    // A control's name, or — when it has none — the first named text INSIDE it:
-    // the label of an icon-and-label button (measured: half of Dia's unnamed
-    // buttons carry one). One first-child step on a text-only walker, so the
-    // search never leaves the control's own subtree. Still text the
-    // application wrote, and treated exactly like any other name.
+    // A control's name, or — when it has none — the first named text INSIDE it (the label of an
+    // icon-and-label button). One first-child step: the search never leaves the control's subtree.
     static string Label(IUIAutomationElement e) {
       string name = Text(e, P_Name);
       if (name.Trim().Length > 0) return name;

@@ -41,7 +41,8 @@ its title. It reads applications through **native Windows UI Automation**, the s
 a screen reader uses, so in the demo it describes what is on screen in Spotify with no Spotify
 integration. It acts only on controls it has just read, by reference, never by screen coordinate.
 References go stale the moment anything changes, and a stale reference is refused, not guessed. It opens
-pages in **your own default browser**, identified from Windows' own record.
+pages in **your own default browser**, identified from Windows' own record, and can read, search,
+follow links in and scroll those pages the same accessible way — on any site, with no site-specific code.
 
 **Security that is structural, not a prompt.** Opening an app Axon doesn't already trust, pressing a
 button in another app, submitting a form or sending anything waits for a click on Axon's own approval

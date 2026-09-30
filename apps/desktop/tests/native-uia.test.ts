@@ -519,3 +519,92 @@ describe.skipIf(process.platform !== 'win32')('the native engine, live, against 
     expect(afterExit.kind).toBe('gone');
   }, 60_000);
 });
+
+// ---------------------------------------------------------------------------
+// Play a song: search → result → play → verified (shaped on Spotify, measured live)
+// ---------------------------------------------------------------------------
+
+describe('playing a song is verified by what the application shows, not by the press', () => {
+  const search: DesktopControl = { nativeRole: 'ControlType.ComboBox', role: 'combobox', name: 'What do you want to play?', automationId: '', sensitive: false, actions: ['expand', 'setText', 'focus'], value: null, runtimeId: '42.10' };
+  const play: DesktopControl = { nativeRole: 'ControlType.Button', role: 'button', name: 'Play Blinding Lights', automationId: '', sensitive: false, actions: ['invoke', 'focus'], value: null, runtimeId: '42.11' };
+
+  function harness(options: { playWorks: boolean }) {
+    let typed = false;
+    let playing = false;
+    const ui: DesktopUi = {
+      uiAvailable: true,
+      observeControls: () =>
+        Promise.resolve({
+          available: true,
+          windowHandle: '9',
+          // Spotify retitles its window to the song while it plays.
+          windowTitle: playing ? 'The Weeknd - Blinding Lights' : 'Spotify Free',
+          controls: typed ? [search, play] : [search],
+          truncated: false,
+          hasMore: false,
+          offset: 0,
+          note: null,
+        } satisfies DesktopScreenReading),
+      actOnControl: (request) => {
+        if (request.action === 'setText') typed = true;
+        if (request.name === play.name && options.playWorks) playing = true;
+        // The search box reads back EMPTY after its text is set — measured.
+        return Promise.resolve({ kind: 'ok', value: request.action === 'setText' ? '' : null });
+      },
+    };
+    const store = new VisualObservationStore();
+    const registry = new ToolRegistry();
+    registry.register(createUiReadTool({ ui, store }));
+    registry.register(createUiClickTool({ ui, store }));
+    registry.register(createKeyboardTypeTool({ ui, store }));
+    const approvals = new ApprovalBroker();
+    const dispatcher = new Dispatcher({ registry, policy: new Policy(), approvals, bus: new EventBus(), states: { enterExecuting: () => {}, enterAwaitingApproval: () => {}, settle: () => {} }, approvalTimeoutMs: 2_000 });
+    dispatcher.beginTurn(new TurnBudget(), 'play blinding lights on spotify');
+    const run = async (tool: string, input: unknown): Promise<ToolResult> => {
+      const pending = dispatcher.dispatch({ callId: newCallId(), tool, input: input as never });
+      // Whatever asks is allowed here: the approval itself is tested elsewhere.
+      const settle = setInterval(() => {
+        for (const request of approvals.list()) approvals.settle(request.callId, 'ALLOW', 'user');
+      }, 5);
+      try {
+        return await pending;
+      } finally {
+        clearInterval(settle);
+      }
+    };
+    const refOf = async (name: string): Promise<string> => {
+      const read = await run('ui.read', {});
+      return (read.ok ? (read.output as { targets: { ref: string; name: string }[] }).targets : []).find((target) => target.name === name)!.ref;
+    };
+    return { run, refOf };
+  }
+
+  type Verified = { verified: { changed: boolean; textApplied: boolean | null; summary: string; newlyOnScreen: string[] } };
+  const verified = (result: ToolResult): Verified['verified'] => (result.ok ? (result.output as Verified).verified : ({} as Verified['verified']));
+
+  it('takes new results as evidence the search was typed, while still saying the box did not read it back', async () => {
+    const h = harness({ playWorks: true });
+    const typed = verified(await h.run('keyboard.type', { ref: await h.refOf(search.name), text: 'Blinding Lights' }));
+    expect(typed.textApplied).toBe(false);
+    expect(typed.changed).toBe(true);
+    expect(typed.newlyOnScreen).toContain('Play Blinding Lights');
+    expect(typed.summary).toMatch(/new items appeared/);
+  });
+
+  it('reports playback only from what changed on screen — the song in the window title', async () => {
+    const h = harness({ playWorks: true });
+    await h.run('keyboard.type', { ref: await h.refOf(search.name), text: 'Blinding Lights' });
+    const pressed = verified(await h.run('ui.click', { ref: await h.refOf(play.name) }));
+    expect(pressed.changed).toBe(true);
+    expect(pressed.summary).toContain('The Weeknd - Blinding Lights');
+  });
+
+  it('does not claim anything played when the press changed nothing', async () => {
+    const h = harness({ playWorks: false });
+    await h.run('keyboard.type', { ref: await h.refOf(search.name), text: 'Blinding Lights' });
+    const pressed = verified(await h.run('ui.click', { ref: await h.refOf(play.name) }));
+    expect(pressed.changed).toBe(false);
+    expect(pressed.newlyOnScreen).toEqual([]);
+    expect(pressed.summary).toMatch(/nothing it can see on screen changed/);
+  });
+});
