@@ -17,7 +17,7 @@
  * what enforces anything.
  */
 
-import { BrowserWindow, ipcMain } from 'electron';
+import { BrowserWindow, ipcMain, type WebContents } from 'electron';
 import { z } from 'zod';
 import {
   AXON_STATES,
@@ -26,6 +26,8 @@ import {
   IPC_CHANNELS,
   JsonValueSchema,
   LISTENING_LIMITS,
+  PLAYBACK_DIAGNOSTICS_LIMITS,
+  PLAYBACK_EVENTS,
   PERSISTENCE_LIMITS,
   type AxonProfile,
   type AxonSettings,
@@ -37,8 +39,10 @@ import {
   type SendMessageResult,
   type SpeechChunk,
   type SpeechDelivery,
+  type StartupStatus,
   type StartListeningResult,
   type StateRequestResult,
+  type PlaybackDiagnostics,
   type VoiceSessionResult,
   type ToolResult,
   type ToolSchema,
@@ -49,6 +53,7 @@ import type { SpeechSink } from '../voice/speech-transport.js';
 import type { CaptureSink } from '../voice/capture-transport.js';
 import type { PersistenceService } from '../persistence/persistence-service.js';
 import type { SettingsService } from '../settings/settings-service.js';
+import { SurfaceRouter } from './surface-router.js';
 import { settingsPatchSchema } from '../persistence/settings-schema.js';
 
 const approvalDecisionPayload = z.object({
@@ -90,6 +95,58 @@ const stateRequestPayload = z.object({
 // five known failures. There is no free-text field here on purpose: a real
 // device error names hardware, drivers and user accounts, and none of that
 // should cross the boundary, reach the timeline, or land in the log.
+/**
+ * Capture diagnostics: bounded numbers and booleans, nothing else. `strict` so
+ * a page cannot smuggle an extra field through a channel that is only ever
+ * printed to a developer console.
+ */
+const finite = (max: number): z.ZodNumber => z.number().finite().min(0).max(max);
+/**
+ * What the window may say about playing reply audio. `.strict()`: an id, one
+ * of four words, two bounded counts and a short reason — nothing else crosses.
+ */
+const playbackDiagnosticsPayload = z
+  .object({
+    speechId: z.string().min(1).max(PLAYBACK_DIAGNOSTICS_LIMITS.maxSpeechIdCharacters),
+    event: z.enum(PLAYBACK_EVENTS),
+    chunks: z.number().int().nonnegative().max(1_000_000),
+    bytes: z.number().int().nonnegative().max(1_000_000_000),
+    reason: z.string().max(PLAYBACK_DIAGNOSTICS_LIMITS.maxReasonCharacters).nullable(),
+  })
+  .strict();
+
+/**
+ * A playback report, or null. Exported so the boundary's rules are tested
+ * against the real schema rather than a copy of it.
+ */
+export function validPlaybackDiagnostics(raw: unknown): PlaybackDiagnostics | null {
+  const parsed = playbackDiagnosticsPayload.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+const captureDiagnosticsPayload = z
+  .object({
+    captureId: z.string().max(64),
+    pipeline: z.enum(['track-processor', 'script-processor']),
+    targetSampleRate: finite(384_000),
+    contextSampleRate: finite(384_000),
+    trackSampleRate: finite(384_000).nullable(),
+    trackChannelCount: finite(64).nullable(),
+    echoCancellation: z.boolean().nullable(),
+    noiseSuppression: z.boolean().nullable(),
+    autoGainControl: z.boolean().nullable(),
+    windowMs: finite(3_600_000),
+    callbacks: finite(1_000_000),
+    producedMs: finite(3_600_000),
+    audioClockMs: finite(3_600_000),
+    maxCallbackGapMs: finite(3_600_000),
+    rms: finite(2),
+    peak: finite(100),
+    silentCallbacks: finite(1_000_000),
+    clippedSamples: finite(1_000_000_000),
+  })
+  .strict();
+
 const captureReportPayload = z.object({
   captureId: z.string().min(1).max(64),
   status: z.enum(['started', 'ended', 'failed']),
@@ -148,6 +205,16 @@ const renamePayload = z.object({
 
 const memoryEnabledPayload = z.object({ id: z.string().min(1).max(64), enabled: z.boolean() });
 
+const appearancePayload = z.object({ appearance: z.enum(['dark', 'light']) }).strict();
+
+const startupPayload = z.object({ enabled: z.boolean() }).strict();
+
+const STARTUP_UNCONFIGURED: StartupStatus = {
+  available: false,
+  enabled: false,
+  reason: 'Starting with Windows is not configured.',
+};
+
 const profilePayload = z
   .object({
     displayName: z.string().max(60).nullable().optional(),
@@ -165,16 +232,26 @@ export interface RendererBridge extends SpeechSink, CaptureSink {
 }
 
 /** Push a payload to every live window. */
-function broadcast(channel: string, payload: unknown): void {
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (window.isDestroyed()) continue;
-    window.webContents.send(channel, payload);
-  }
-}
 
 export interface BridgeDependencies {
   readonly persistence: PersistenceService;
   readonly settings: SettingsService;
+  /** Recolour the native frame of the window that asked. Cosmetic only. */
+  readonly setAppearance?: (sender: WebContents, appearance: 'dark' | 'light') => void;
+  /**
+   * The one window that holds the microphone and the speaker: the overlay.
+   *
+   * When present, capture commands and speech go to it and nowhere else, and
+   * microphone frames, capture reports and playback reports are accepted from
+   * it and nowhere else. Without it (unit harnesses that open no overlay) every
+   * window is addressed, as before. Two windows each opening the microphone
+   * would send every frame twice.
+   */
+  readonly voiceSurface?: () => WebContents | null;
+  /** Let the overlay's own window take a click, or pass clicks through. */
+  readonly setOverlayInteractive?: (sender: WebContents, interactive: boolean) => void;
+  /** Per-user start at sign-in. */
+  readonly startup?: { get(): StartupStatus; set(enabled: boolean): StartupStatus };
 }
 
 export function installRendererBridge(
@@ -182,10 +259,25 @@ export function installRendererBridge(
   orchestrator: Orchestrator,
   deps?: BridgeDependencies,
 ): RendererBridge {
+  // Every send to a window and every "is this the voice surface?" goes through
+  // one router, which never reads a destroyed window's contents. See
+  // `surface-router.ts` for the crash that made this necessary.
+  const router = new SurfaceRouter<WebContents>({
+    voiceSurface: deps?.voiceSurface,
+    windows: () => BrowserWindow.getAllWindows(),
+  });
+
   // --- main -> renderer ---------------------------------------------------
   const unsubscribe = bus.subscribe((event) => {
-    broadcast(IPC_CHANNELS.EVENT, event);
+    router.broadcast(IPC_CHANNELS.EVENT, event);
   });
+
+  /** Audio and capture commands: to the live voice surface, or everywhere when none is configured. */
+  // Returns whether a live voice surface took it, which the reply-audio
+  // diagnostics count: a chunk sent to no window is a chunk nobody heard.
+  const toVoice = (channel: string, payload: unknown): boolean => router.toVoice(channel, payload);
+  /** Once there is a voice surface, only it — while it is alive — may speak for the microphone or the speaker. */
+  const fromVoice = (sender: WebContents): boolean => router.fromVoice(sender);
 
   // --- renderer -> main ---------------------------------------------------
   ipcMain.handle(IPC_CHANNELS.SNAPSHOT, (): AxonSnapshot => orchestrator.snapshot());
@@ -230,9 +322,10 @@ export function installRendererBridge(
     return orchestrator.sendUserMessage(parsed.data.text, 'text');
   });
 
-  ipcMain.handle(IPC_CHANNELS.SPEECH_REPORT, (_event, raw: unknown): void => {
+  ipcMain.handle(IPC_CHANNELS.SPEECH_REPORT, (event, raw: unknown): void => {
     const parsed = speechReportPayload.safeParse(raw);
     if (!parsed.success) throw invalidPayload(IPC_CHANNELS.SPEECH_REPORT, parsed.error);
+    if (!fromVoice(event.sender)) return;
 
     // Advisory. The service ignores an id that is not the utterance in
     // flight, and main's watchdog bounds the state either way.
@@ -260,18 +353,40 @@ export function installRendererBridge(
     orchestrator.stopListening();
   });
 
-  ipcMain.handle(IPC_CHANNELS.LISTEN_REPORT, (_event, raw: unknown): void => {
+  ipcMain.handle(IPC_CHANNELS.LISTEN_REPORT, (event, raw: unknown): void => {
     const parsed = captureReportPayload.safeParse(raw);
     if (!parsed.success) throw invalidPayload(IPC_CHANNELS.LISTEN_REPORT, parsed.error);
+    if (!fromVoice(event.sender)) return;
 
     orchestrator.reportCapture(parsed.data.captureId, parsed.data.status, parsed.data.failure);
+  });
+
+  // Numeric PLAYBACK diagnostics: what the window did with the voice agent's
+  // reply audio. The same rules as capture diagnostics — the live voice
+  // surface only, strictly parsed, fire and forget, and dropped by main
+  // unless a development build asked for voice diagnostics.
+  ipcMain.on(IPC_CHANNELS.SPEECH_PLAYBACK_DIAGNOSTICS, (event, raw: unknown): void => {
+    if (!fromVoice(event.sender)) return;
+    const report = validPlaybackDiagnostics(raw);
+    if (report) orchestrator.reportPlaybackDiagnostics(report);
+  });
+
+  // Numeric capture diagnostics. Fire and forget; dropped unless they come
+  // from the live voice surface, parse, and main asked for them.
+  ipcMain.on(IPC_CHANNELS.LISTEN_DIAGNOSTICS, (event, raw: unknown): void => {
+    if (!fromVoice(event.sender)) return;
+    const parsed = captureDiagnosticsPayload.safeParse(raw);
+    if (!parsed.success) return;
+    orchestrator.reportCaptureDiagnostics(parsed.data);
   });
 
   // `on`, not `handle`: frames are fire-and-forget. There is no reply, so a
   // compromised page cannot use the return value to learn whether a capture id
   // it guessed was the live one, and no promise is allocated per 64ms of
   // audio.
-  ipcMain.on(IPC_CHANNELS.LISTEN_AUDIO, (_event, raw: unknown): void => {
+  ipcMain.on(IPC_CHANNELS.LISTEN_AUDIO, (event, raw: unknown): void => {
+    // Frames from any window but the voice surface are dropped unread.
+    if (!fromVoice(event.sender)) return;
     const frame = validAudioFrame(raw);
     if (!frame) return;
     orchestrator.pushAudioFrame(frame.captureId, frame.samples);
@@ -369,6 +484,27 @@ export function installRendererBridge(
    * The activation is recorded as 'manual' because that is what a click is.
    * The wake word and the hotkey record themselves differently, in main.
    */
+  ipcMain.handle(IPC_CHANNELS.WINDOW_APPEARANCE, (event, raw: unknown): void => {
+    const parsed = appearancePayload.safeParse(raw);
+    if (!parsed.success) throw invalidPayload(IPC_CHANNELS.WINDOW_APPEARANCE, parsed.error);
+    deps?.setAppearance?.(event.sender, parsed.data.appearance);
+  });
+
+  // `on`, fire and forget: a boolean from the overlay about its own pointer.
+  ipcMain.on(IPC_CHANNELS.OVERLAY_INTERACTIVE, (event, raw: unknown): void => {
+    if (typeof raw !== 'boolean') return;
+    if (!router.hasVoiceSurface || !router.fromVoice(event.sender)) return;
+    deps?.setOverlayInteractive?.(event.sender, raw);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.STARTUP_GET, (): StartupStatus => deps?.startup?.get() ?? STARTUP_UNCONFIGURED);
+
+  ipcMain.handle(IPC_CHANNELS.STARTUP_SET, (_event, raw: unknown): StartupStatus => {
+    const parsed = startupPayload.safeParse(raw);
+    if (!parsed.success) throw invalidPayload(IPC_CHANNELS.STARTUP_SET, parsed.error);
+    return deps?.startup?.set(parsed.data.enabled) ?? STARTUP_UNCONFIGURED;
+  });
+
   ipcMain.handle(IPC_CHANNELS.VOICE_SESSION_START, (): VoiceSessionResult => {
     return orchestrator.startVoiceSession('manual');
   });
@@ -390,20 +526,20 @@ export function installRendererBridge(
   return {
     // --- SpeechSink: main -> renderer ------------------------------------
     deliver(delivery: SpeechDelivery): void {
-      broadcast(IPC_CHANNELS.SPEECH_AUDIO, delivery);
+      toVoice(IPC_CHANNELS.SPEECH_AUDIO, delivery);
     },
 
-    chunk(chunk: SpeechChunk): void {
-      broadcast(IPC_CHANNELS.SPEECH_CHUNK, chunk);
+    chunk(chunk: SpeechChunk): boolean {
+      return toVoice(IPC_CHANNELS.SPEECH_CHUNK, chunk);
     },
 
     stop(speechId: string): void {
-      broadcast(IPC_CHANNELS.SPEECH_STOP, speechId);
+      toVoice(IPC_CHANNELS.SPEECH_STOP, speechId);
     },
 
     // --- CaptureSink: main -> renderer -----------------------------------
     command(command: CaptureCommand): void {
-      broadcast(IPC_CHANNELS.LISTEN_CAPTURE, command);
+      toVoice(IPC_CHANNELS.LISTEN_CAPTURE, command);
     },
 
     dispose(): void {
@@ -415,6 +551,7 @@ export function installRendererBridge(
       // listener and has to be removed separately, or a disposed bridge would
       // keep accepting frames.
       ipcMain.removeAllListeners(IPC_CHANNELS.LISTEN_AUDIO);
+      ipcMain.removeAllListeners(IPC_CHANNELS.OVERLAY_INTERACTIVE);
     },
   };
 }

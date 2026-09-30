@@ -15,12 +15,19 @@
  * OBSERVATION below. Anything that outlives this function cannot reach either.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { EventBus } from './bus/event-bus.js';
 import { JsonlEventSink } from './bus/jsonl-sink.js';
 import { createBrain } from './brain/create-brain.js';
 import { createVoiceAgent } from './agent/create-voice-agent.js';
-import { WakeWordDetector } from './wake/wake-word.js';
+import { VOICE_AGENT_ENDPOINT } from './agent/assemblyai-client.js';
+import { WAKE_ACTIVITY_OPTIONS, createWakeDetector } from './wake/create-wake-detector.js';
+import type { WakeDetector } from './wake/wake-detector.js';
+import { VoiceActivityDetector } from './voice/vad.js';
+import { VoiceDiagnostics } from './voice/voice-diagnostics.js';
+import { parseCaptureProcessing } from './voice/capture-processing.js';
 import { PersistenceService } from './persistence/persistence-service.js';
 import { PersistentConversationMemory } from './persistence/persistent-memory.js';
 import { SettingsService, directoryExists } from './settings/settings-service.js';
@@ -30,6 +37,8 @@ import { AxonBrowser } from './browser/axon-browser.js';
 import { Orchestrator } from './orchestrator/orchestrator.js';
 import { ElectronAppLauncher, ElectronScreenCapturer } from './platform/electron-platform.js';
 import { WindowsDesktop } from './platform/windows-desktop.js';
+import { AppCatalog } from './apps/app-catalog.js';
+import { VisualObservationStore } from './screen/visual-observation.js';
 import { createDefaultRegistry } from './tools/registry.js';
 import { createTextToSpeech } from './voice/create-tts.js';
 import { createSpeechToText } from './voice/create-stt.js';
@@ -70,6 +79,30 @@ export { applySessionSecurity, installSecurityHooks } from './security.js';
  * verifies its own idea of how configuration is loaded.
  */
 export { envFileCandidates, loadEnvFile } from './env-file.js';
+
+/**
+ * The preflight, re-exported for `scripts/preflight.cjs`.
+ *
+ * The script supplies the probes — it is the only thing that can, since they
+ * touch Electron, the machine's microphone permission and the real runtime —
+ * and this module supplies the runner and the renderer, so the report's rules
+ * about secrets and about what counts as ready live in one place and are unit
+ * tested rather than re-implemented in a script nobody runs in CI.
+ *
+ * `VOICE_AGENT_HOST` goes with them: the preflight needs a hostname to try a
+ * TCP connect against, and deriving it here keeps the endpoint itself a
+ * constant nothing can redirect. This is a hostname, never a URL the socket
+ * uses — `assemblyai-client.ts` still owns that.
+ */
+export { renderPreflight, runPreflight } from './demo/preflight.js';
+// The application compatibility probe (`npm run compat:probe`): read-only
+// measurement of discovery, window identity and accessibility per application.
+export { runCompatibilityProbe } from './diagnostics/compat-probe.js';
+export { WindowsDesktop } from './platform/windows-desktop.js';
+export { ElectronAppLauncher } from './platform/electron-platform.js';
+export { recordDemo, renderRecording, serializeRecording } from './demo/recording.js';
+import { DemoRecorder } from './demo/recording.js';
+export const VOICE_AGENT_HOST = new URL(VOICE_AGENT_ENDPOINT).hostname;
 export { PersistenceService } from './persistence/persistence-service.js';
 export { openDatabase } from './persistence/sqlite.js';
 export { targetVersion as currentTargetVersion } from './persistence/migrations.js';
@@ -89,6 +122,12 @@ export interface AxonRuntime {
   readonly listening: ListeningService;
   readonly browser: AxonBrowser;
   readonly persistence: PersistenceService;
+  /**
+   * The native accessibility engine (Phase 4B), ended on quit. It would also
+   * end by itself — its stdin closes with Axon — but a quit says so rather
+   * than relying on it.
+   */
+  readonly desktopEngine: { dispose(): void };
   readonly settings: SettingsService;
   /**
    * The local wake word.
@@ -97,7 +136,7 @@ export interface AxonRuntime {
    * the verification harness drives the real detector rather than a
    * reconstruction. It holds no credential and opens no socket.
    */
-  readonly wakeWord: WakeWordDetector;
+  readonly wakeWord: WakeDetector;
   /**
    * When page code may obtain a microphone.
    *
@@ -105,6 +144,13 @@ export interface AxonRuntime {
    * entry point and the verification harness ask the same object.
    */
   readonly micGate: MicGate;
+  /**
+   * The demo recording, or null when none was asked for.
+   *
+   * Null is the normal state. `index.ts` closes it on quit, which is when the
+   * file is written — there is no partial recording to interpret.
+   */
+  readonly demoRecording: DemoRecorder | null;
 }
 
 export interface RuntimeInputs extends ConfigInputs {
@@ -136,6 +182,26 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
   const bus = new EventBus();
   const sink = new JsonlEventSink(config.eventLogPath);
   bus.addSink(sink);
+
+  // --- the demo recording, when one was asked for -------------------------
+  // Developer-only and off by default (see `demoRecordingEnabled`). It holds
+  // decisions rather than content and writes one file at close; the rules
+  // about what may be in it live in `demo/recording.ts` and are unit tested
+  // there rather than restated here.
+  const demoRecording = config.demoRecordingEnabled
+    ? new DemoRecorder({
+        filePath: config.demoRecordingPath,
+        writeFile: (filePath, contents) => {
+          fs.mkdirSync(path.dirname(filePath), { recursive: true });
+          fs.writeFileSync(filePath, contents, 'utf8');
+        },
+      })
+    : null;
+  if (demoRecording) {
+    bus.subscribe((event) => {
+      demoRecording.observe(event);
+    });
+  }
 
   // --- persistence ---------------------------------------------------------
   // First, and before anything that might want to read a setting. The database
@@ -197,6 +263,33 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
   // the database, so what lands here is an absolute path or nothing.
   const workspaceRoot = persistence.currentSettings().workspacePath ?? config.workspaceRoot;
 
+  // ONE desktop port, satisfying both interfaces: window enumeration and the
+  // accessibility layer. They are handed over as two dependencies because they
+  // are two privileges of different sizes, and a caller that only needs to
+  // raise a window should not receive the half that activates controls.
+  const desktop = new WindowsDesktop({ platform: process.platform });
+
+  // Where looks at the screen are recorded. Created here, held by the runtime,
+  // and shared by every tool that observes or acts — see `registry.ts` for why
+  // there must be exactly one.
+  const observations = new VisualObservationStore();
+
+  // The applications installed on this computer, as the Start menu lists
+  // them. Taken once now, in the background, so the first "open Spotify"
+  // does not wait on it; kept ten minutes, then taken again when asked for.
+  // DISCOVERED IS NOT TRUSTED: the catalog is what `app.launch` searches,
+  // and every discovered application still asks before it opens.
+  const catalog = desktop.appsAvailable ? new AppCatalog(() => desktop.listStartMenuApps()) : null;
+  catalog
+    ?.refresh()
+    .then((apps) => {
+      const blocked = apps.filter((app) => app.blocked).length;
+      console.warn(`[apps] found ${apps.length} applications in the Start menu (${blocked} never opened by Axon)`);
+    })
+    .catch((error: unknown) => {
+      console.warn(`[apps] could not list installed applications: ${error instanceof Error ? error.message : String(error)}`);
+    });
+
   const registry = createDefaultRegistry({
     launcher: new ElectronAppLauncher(),
     capturer: new ElectronScreenCapturer(),
@@ -209,7 +302,13 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
     persistence,
     // Window enumeration and focus. Available on Windows; elsewhere the tools
     // are simply not registered and the model is not told about them.
-    desktop: new WindowsDesktop({ platform: process.platform }),
+    desktop,
+    // Reading and activating on-screen controls, on the same platform terms.
+    ui: desktop,
+    observations,
+    // Installed-application discovery and the default browser.
+    apps: desktop,
+    catalog,
   });
 
   // The upgrade Step 2 predicted, and it really is one line: the same `Memory`
@@ -293,7 +392,28 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
     workspaceRoot,
   });
 
+  // Numeric audio-path diagnostics: silent unless a development build asked
+  // for voice or wake debugging. Lines carry formats, counts, timing, loudness
+  // and — for voice debugging only — the provider's transcript. Never audio.
+  const diagnostics = new VoiceDiagnostics({
+    log:
+      config.voiceDebugEnabled || config.wakeDebugEnabled
+        ? (line: string): void => {
+            if (line.startsWith('[voice]') && !config.voiceDebugEnabled) return;
+            if (line.startsWith('[wake]') && !config.wakeDebugEnabled) return;
+            console.warn(line);
+          }
+        : null,
+  });
+
+  // Development A/B of microphone processing: one variable at a time, refused
+  // otherwise. Never set in a packaged build (`config.ts`).
+  const processing = parseCaptureProcessing(config.captureProcessing);
+  if (processing.refused && config.wakeDebugEnabled) console.warn(`[wake] AXON_CAPTURE_PROCESSING ${processing.refused}`);
+
   const orchestrator = new Orchestrator({
+    diagnostics,
+    captureProcessing: processing.processing,
     bus,
     registry,
     approvalTimeoutMs: config.approvalTimeoutMs,
@@ -310,6 +430,9 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
     speechChunks: speechTransport,
     captureCommand: (command) => captureTransport.command(command),
     micGate,
+    // Forgotten on shutdown, alongside the browser window. A quit that leaves
+    // a picture of the user's screen in memory is the same class of leak.
+    observations,
     // Without this the orchestrator holds no persistence at all: it reports
     // the database as unavailable to the renderer, and — the part that
     // matters — `contextForTurn()` is never called, so no session summary, no
@@ -319,17 +442,39 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
   });
 
   // --- wake word ------------------------------------------------------------
-  // Reuses the SAME offline recognizer the typed voice path uses. It opens no
-  // socket and holds no credential: while it is armed, microphone audio goes
-  // to a local process and nowhere else, which is the whole of Axon's
-  // "before activation, audio stays local" guarantee.
-  const wakeWord = new WakeWordDetector({
+  // A DEDICATED LOCAL KEYWORD SPOTTER by default, in its own child process
+  // with a six-name environment and no credential on it. While it is armed,
+  // microphone audio goes to that process and nowhere else, which is the whole
+  // of Axon's "before activation, audio stays local" guarantee.
+  //
+  // Which engine, and why this one rather than the Windows recognizer that
+  // shipped first, is argued in `create-wake-detector.ts`. The short version
+  // is that the Windows recognizer scored 0/15 on a real human microphone.
+  const wake = createWakeDetector({
+    engine: config.wakeEngine,
+    threshold: config.wakeThreshold,
+    calibrate: config.wakeCalibrate,
+    focus: config.wakeFocus,
+    // Both used only by the Windows engine, which is kept as the control arm
+    // for measurements. The spotter needs neither: it is streaming, so it has
+    // no use for an activity detector, and it is not a recognizer.
     stt,
+    activity: () => new VoiceActivityDetector(WAKE_ACTIVITY_OPTIONS),
+    // Developer diagnostics, off unless a development build was started with
+    // AXON_WAKE_DEBUG=1. To the console only: never the event log, never IPC.
+    debug: config.wakeDebugEnabled
+      ? (line: string): void => {
+          console.warn(`[wake] ${line}`);
+        }
+      : null,
     onWake: () => {
       // The one thing a wake phrase does: ask for a session. Everything about
       // whether that is allowed is the orchestrator's decision, and the
       // activation is recorded on the event stream.
-      orchestrator.startVoiceSession('wake-word');
+      const result = orchestrator.startVoiceSession('wake-word');
+      if (config.wakeDebugEnabled) {
+        console.warn(`[wake] activation ${result.accepted ? 'started a voice session' : `was refused: ${result.error ?? 'no reason given'}`}`);
+      }
     },
     onArmedChanged: (armed) => {
       orchestrator.setWakeArmed(armed);
@@ -338,6 +483,7 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
       bus.emit({ type: 'OBSERVATION', callId: null, summary: message, detail: null });
     },
   });
+  const wakeWord = wake.detector;
 
   // Frames now have somewhere to go while Axon is armed. Until this line the
   // detector would have been armed and deaf.
@@ -408,7 +554,8 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
       // A provider name and a boolean. Never the key, never the endpoint.
       voiceAgent: orchestrator.voiceAgentStatus().name,
       voiceAgentAvailable: orchestrator.voiceAgentStatus().available,
-      wakeWord: wakeWord.available ? 'local' : 'unavailable',
+      // An engine name and a boolean. Never audio, never a path to a model.
+      wakeWord: wakeWord.available ? wake.engineName : 'unavailable',
       persistence: persistenceAvailable ? 'sqlite' : 'unavailable',
       schemaVersion: persistence.status().schemaVersion,
       sessions: persistence.status().sessionCount,
@@ -427,9 +574,11 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
     listening,
     browser,
     persistence,
+    desktopEngine: desktop,
     settings,
     wakeWord,
     micGate,
+    demoRecording,
   };
 }
 

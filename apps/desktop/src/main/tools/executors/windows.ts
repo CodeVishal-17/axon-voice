@@ -25,6 +25,8 @@
 
 import { z } from 'zod';
 import {
+  ClarificationRequired,
+  ToolError,
   defineTool,
   type JsonObject,
   type PrecheckVerdict,
@@ -34,7 +36,16 @@ import {
   type ToolSummary,
 } from '@axon/core';
 import type { DesktopWindow, DesktopWindows, WindowAction } from '../../platform/windows-desktop.js';
-import { appForWindowTitle } from './app-registry.js';
+import { appForWindowTitle, listApps } from './app-registry.js';
+import {
+  clarificationFor,
+  looksLikeCommand,
+  normalize,
+  resolveApp as resolveDiscovered,
+  type AppCatalog,
+  type DiscoveredApp,
+} from '../../apps/app-catalog.js';
+import { chooseWindow, ownerOf, windowsOf } from '../../apps/window-identity.js';
 
 /**
  * A window reference.
@@ -165,7 +176,45 @@ function windowRisk(window: DesktopWindow | null, action: WindowAction): RiskAss
 }
 
 /** Windows as the model sees them: a reference, a title, and two booleans. */
-function toWindowOutput(windows: readonly (DesktopWindow & { readonly ref: string })[]): JsonObject {
+/**
+ * After the desktop refused an act: was the window simply gone?
+ *
+ * Only a listing that SUCCEEDED can answer that. A listing that failed has
+ * established nothing, so it is never read as "the window is not there" —
+ * that confusion is how "the listing timed out" used to reach the user as
+ * "that application is not running".
+ */
+async function goneFrom(desktop: DesktopWindows, handle: string): Promise<boolean> {
+  try {
+    const now = await desktop.list();
+    return !now.some((entry) => entry.handle === handle);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The fresh listing that VERIFIES an act, or null if it could not be taken.
+ *
+ * The act has already happened by the time this runs. If the re-check then
+ * fails, the honest report is "done, but not confirmed" — `verified: false` —
+ * not a failure of an act that may well have worked.
+ */
+async function relist(
+  registry: WindowRegistry,
+  desktop: DesktopWindows,
+): Promise<readonly (DesktopWindow & { readonly ref: string })[] | null> {
+  try {
+    return registry.record(await desktop.list());
+  } catch {
+    return null;
+  }
+}
+
+function toWindowOutput(
+  windows: readonly (DesktopWindow & { readonly ref: string })[],
+  apps: readonly DiscoveredApp[] | null = null,
+): JsonObject {
   return {
     windows: windows.map((window) => ({
       ref: window.ref,
@@ -177,6 +226,10 @@ function toWindowOutput(windows: readonly (DesktopWindow & { readonly ref: strin
       // Which permitted application Axon believes it is, when it recognises
       // one. Null is common and is not a problem.
       application: appForWindowTitle(window.title)?.key ?? null,
+      // WHICH INSTALLED APPLICATION OWNS IT, from the operating system's record
+      // of the owning process — Axon's own id and name, never a process id, a
+      // package identity or a path. Null when Axon cannot tell.
+      owner: ownerView(window, apps),
     })),
     count: windows.length,
     note:
@@ -189,7 +242,16 @@ function toWindowOutput(windows: readonly (DesktopWindow & { readonly ref: strin
 // window.list
 // ---------------------------------------------------------------------------
 
-export function createWindowListTool(desktop: DesktopWindows, registry: WindowRegistry): RegisteredTool {
+function ownerView(window: DesktopWindow, apps: readonly DiscoveredApp[] | null): JsonObject | null {
+  const owner = apps ? ownerOf(window, apps) : null;
+  return owner ? { id: owner.app.id, name: owner.app.name } : null;
+}
+
+export function createWindowListTool(
+  desktop: DesktopWindows,
+  registry: WindowRegistry,
+  catalog: AppCatalog | null = null,
+): RegisteredTool {
   return defineTool<Record<string, never>, JsonObject>({
     name: 'window.list',
     title: 'List open windows',
@@ -216,7 +278,7 @@ export function createWindowListTool(desktop: DesktopWindows, registry: WindowRe
     async execute(_input, ctx): Promise<JsonObject> {
       const windows = registry.record(await desktop.list());
       ctx.observe(`Listed ${windows.length} open window${windows.length === 1 ? '' : 's'}`, { count: windows.length });
-      return toWindowOutput(windows);
+      return toWindowOutput(windows, catalog?.snapshot() ?? null);
     },
   });
 }
@@ -259,17 +321,23 @@ function windowActionTool(
 
     async execute(input, ctx): Promise<JsonObject> {
       const window = registry.describe(input.ref);
-      if (!window) throw new Error('That window is no longer in Axon\'s listing. List the windows again.');
+      // An expired or superseded reference: the window may well still be open,
+      // so "look again" is the remedy, which is what STALE_REFERENCE says.
+      if (!window) throw new ToolError('STALE_REFERENCE', 'That window is no longer in Axon\'s listing. List the windows again.');
 
       const moved = await desktop.act(window.handle, action);
       if (!moved) {
+        if (await goneFrom(desktop, window.handle)) {
+          throw new ToolError('WINDOW_NOT_FOUND', `"${window.title}" is not open any more.`);
+        }
         throw new Error(`"${window.title}" could not be brought ${action === 'focus' ? 'to the front' : `to a ${action}d state`}. It may have been closed.`);
       }
 
       // OBSERVE, then VERIFY. The call returning is not evidence: a window can
       // refuse focus, and an agent that reports success from a return value is
-      // reporting its own optimism.
-      const after = registry.record(await desktop.list());
+      // reporting its own optimism. A re-check that cannot be taken leaves the
+      // act unconfirmed rather than turning it into a failure.
+      const after = (await relist(registry, desktop)) ?? [];
       const now = after.find((entry) => entry.handle === window.handle) ?? null;
 
       const verified =
@@ -350,48 +418,163 @@ export function createWindowMaximizeTool(desktop: DesktopWindows, registry: Wind
  * Ambiguity is a refusal. Two Notepad windows mean Axon cannot know which one
  * was meant, and raising either would be choosing on the user's behalf; it
  * lists them and asks.
+ *
+ * PHASE 3: APPLICATIONS AXON DISCOVERED. Given the catalog, the input becomes
+ * a NAME, resolved exactly as `app.launch` resolves it — the built-in keys
+ * first, then the catalog — and the window is the one whose title names that
+ * application. Still only windows Axon lists, still never a handle or a
+ * title from the model, and a name that is a path or a command, or that
+ * belongs to a blocked application, is refused. Without the catalog the tool
+ * is exactly what it was: the enum.
  */
 export function createAppFocusTool(
   desktop: DesktopWindows,
   registry: WindowRegistry,
   appKeys: readonly [string, ...string[]],
+  catalog: AppCatalog | null = null,
 ): RegisteredTool {
   const inputSchema = z.object({
-    app: z.enum(appKeys).describe('Which permitted application to bring to the front.'),
+    app: catalog
+      ? z
+          .string()
+          .trim()
+          .min(1)
+          .max(100)
+          .describe('The application\'s NAME ("Notepad", "Spotify"), or an id Axon gave you. Never a path or a command.')
+      : z.enum(appKeys).describe('Which permitted application to bring to the front.'),
   });
-  type Input = z.infer<typeof inputSchema>;
+  type Input = { app: string };
+
+  /** What the request names, as Axon resolves it right now. Synchronous: from the catalog as it stands. */
+  type Target =
+    | { kind: 'built-in'; key: string; label: string }
+    | { kind: 'discovered'; app: DiscoveredApp }
+    | { kind: 'refused'; reason: string }
+    | { kind: 'none' }
+    | { kind: 'ambiguous'; candidates: readonly DiscoveredApp[] }
+    | { kind: 'unknown' };
+
+  const builtInKey = (request: string): { key: string; label: string } | null => {
+    const wanted = normalize(request);
+    const entry = listApps().find(
+      (app) => appKeys.includes(app.key) && (normalize(app.key) === wanted || normalize(app.label) === wanted),
+    );
+    return entry ? { key: entry.key, label: entry.label } : null;
+  };
+
+  const resolveTarget = (request: string, apps: readonly DiscoveredApp[] | null): Target => {
+    if (!catalog) return { kind: 'built-in', key: request, label: request };
+    if (looksLikeCommand(request)) return { kind: 'refused', reason: 'Axon switches to applications by name, never by a path or a command.' };
+    const trusted = builtInKey(request);
+    if (trusted) return { kind: 'built-in', ...trusted };
+    if (!apps) return { kind: 'unknown' };
+    const resolution = resolveDiscovered(apps, request);
+    if (resolution.kind === 'none') return { kind: 'none' };
+    if (resolution.kind === 'match') {
+      return resolution.app.blocked ? { kind: 'refused', reason: resolution.app.blocked } : { kind: 'discovered', app: resolution.app };
+    }
+    const open = resolution.candidates.filter((app) => !app.blocked);
+    const first = resolution.candidates[0];
+    if (open.length === 0 && first?.blocked) return { kind: 'refused', reason: first.blocked };
+    if (open.length === 1 && open[0]) return { kind: 'discovered', app: open[0] };
+    return { kind: 'ambiguous', candidates: open };
+  };
+
+  const labelOf = (target: Target, request: string): string =>
+    target.kind === 'built-in' ? target.label : target.kind === 'discovered' ? target.app.name : request;
 
   return defineTool<Input, JsonObject>({
     name: 'app.focus',
     title: 'Switch to an application',
-    description:
-      `Bring an already-running permitted application to the front. Permitted values: ${appKeys.join(', ')}. ` +
-      'Fails if the application is not running, and asks if more than one of its windows is open.',
-    inputSchema,
+    description: catalog
+      ? 'Bring an already-running application to the front, by NAME — one of the built-in applications ' +
+        `(${appKeys.join(', ')}) or any application installed on this computer ("Spotify", "VS Code"). ` +
+        'Never a path or a command. Fails if the application is not running, and asks if more than one of ' +
+        'its windows is open.'
+      : `Bring an already-running permitted application to the front. Permitted values: ${appKeys.join(', ')}. ` +
+        'Fails if the application is not running, and asks if more than one of its windows is open.',
+    inputSchema: inputSchema as unknown as z.ZodType<Input>,
 
-    resolveRisk: (): RiskAssessment => ({
-      level: 'SAFE',
-      reason: 'Bringing a window to the front changes what is on screen and nothing else.',
-    }),
+    precheck(input): PrecheckVerdict {
+      const target = resolveTarget(input.app, catalog?.snapshot() ?? null);
+      if (target.kind === 'none') {
+        return { ok: false, retryable: false, kind: 'NOT_FOUND', reason: `No application called "${input.app}" was found on this computer.` };
+      }
+      if (target.kind === 'ambiguous') {
+        return { ok: false, retryable: false, clarify: true, reason: clarificationFor(input.app, target.candidates) };
+      }
+      return { ok: true };
+    },
 
-    summarize: (input): ToolSummary => ({
-      title: `Axon wants to switch to ${input.app}`,
-      parameters: [{ label: 'Application', value: input.app }],
-    }),
+    resolveRisk: (input): RiskAssessment => {
+      const target = resolveTarget(input.app, catalog?.snapshot() ?? null);
+      if (target.kind === 'refused') return { level: 'FORBIDDEN', reason: target.reason };
+      return {
+        level: 'SAFE',
+        reason: 'Bringing a window to the front changes what is on screen and nothing else.',
+      };
+    },
+
+    summarize: (input): ToolSummary => {
+      const label = labelOf(resolveTarget(input.app, catalog?.snapshot() ?? null), input.app);
+      return {
+        title: `Axon wants to switch to ${label}`,
+        parameters: [{ label: 'Application', value: label }],
+      };
+    },
 
     sideEffect: (): SideEffectClass => 'LOCAL',
 
     async execute(input, ctx): Promise<JsonObject> {
-      const windows = registry.record(await desktop.list());
-      const matches = windows.filter((window) => appForWindowTitle(window.title)?.key === input.app);
+      // Resolved again against a catalog that is current, not the one the
+      // precheck saw; a failure to list is thrown, classified, never read as
+      // "not installed".
+      const apps = catalog ? await catalog.current() : null;
+      const wanted = resolveTarget(input.app, apps);
+      if (wanted.kind === 'refused') throw new ToolError('FORBIDDEN', wanted.reason);
+      if (wanted.kind === 'none' || wanted.kind === 'unknown') {
+        throw new ToolError('NOT_FOUND', `No application called "${input.app}" was found on this computer.`);
+      }
+      if (wanted.kind === 'ambiguous') throw new ClarificationRequired(clarificationFor(input.app, wanted.candidates));
 
+      const label = labelOf(wanted, input.app);
+      const windows = registry.record(await desktop.list());
+
+      // WHICH WINDOWS ARE THIS APPLICATION'S. A built-in application is
+      // recognised by its title, as it always was. A discovered one is
+      // recognised by the process that owns the window first — so Spotify is
+      // found while its title is a song, and WhatsApp is never confused with
+      // WhatsApp Beta — and by its title only when the operating system cannot
+      // say, and never on a window it attributes to another application.
+      let matches: readonly (typeof windows)[number][];
+      let basis: 'identity' | 'title' = 'title';
+      if (wanted.kind === 'discovered') {
+        const candidates = windowsOf(wanted.app, windows, apps ?? []);
+        basis = candidates.basis;
+        const choice = chooseWindow(candidates.windows);
+        const chosen = choice.kind === 'one' ? windows.find((window) => window.handle === choice.window.handle) : undefined;
+        matches = chosen ? [chosen] : windows.filter((window) => candidates.windows.some((candidate) => candidate.handle === window.handle));
+      } else {
+        matches = windows.filter((window) => appForWindowTitle(window.title)?.key === wanted.key);
+      }
+
+      // Safe to say now: a listing that FAILED throws before this line (see
+      // `WindowsDesktop.list`), so an empty match here is a real absence and
+      // not a timeout wearing its clothes.
       if (matches.length === 0) {
-        throw new Error(`${input.app} does not appear to be running. Open it first if that is what you meant.`);
+        throw new ToolError(
+          'WINDOW_NOT_FOUND',
+          `${label} does not appear to be running. Open it first if that is what you meant.`,
+        );
       }
       if (matches.length > 1) {
-        throw new Error(
-          `There are ${matches.length} ${input.app} windows open, so Axon cannot tell which one you meant. ` +
-            'List the windows and pick one.',
+        // ASK, DO NOT GUESS. Raising the wrong one of two windows is not a
+        // small error — it is Axon choosing on the user's behalf between two
+        // things it cannot tell apart. Thrown as a clarification rather than a
+        // failure so what the user hears is a question.
+        throw new ClarificationRequired(
+          `There are ${matches.length} ${label} windows open. Which one do you mean — ` +
+            `${matches.map((window) => `"${window.title}"`).join(' or ')}?`,
         );
       }
 
@@ -399,19 +582,28 @@ export function createAppFocusTool(
       if (!target) throw new Error('That window is no longer listed.');
 
       const moved = await desktop.act(target.handle, 'focus');
-      if (!moved) throw new Error(`"${target.title}" could not be brought to the front.`);
+      if (!moved) {
+        if (await goneFrom(desktop, target.handle)) {
+          throw new ToolError('WINDOW_NOT_FOUND', `"${target.title}" is not open any more.`);
+        }
+        throw new Error(`"${target.title}" could not be brought to the front.`);
+      }
 
-      const after = registry.record(await desktop.list());
+      const after = (await relist(registry, desktop)) ?? [];
       const verified = after.find((entry) => entry.handle === target.handle)?.foreground === true;
 
       ctx.observe(verified ? `Switched to "${target.title}"` : `Asked to switch to "${target.title}", but it is not in front`, {
         verified,
+        basis,
       });
 
       return {
-        ...toWindowOutput(after),
+        ...toWindowOutput(after, apps),
         verified: {
           changed: verified,
+          // How Axon knew the window was this application's: 'identity' is the
+          // operating system's word, 'title' is the window's own claim.
+          recognisedBy: basis,
           summary: verified
             ? `"${target.title}" is now in front.`
             : `Axon asked to switch to "${target.title}", but a fresh listing does not show it in front. Say what you saw.`,

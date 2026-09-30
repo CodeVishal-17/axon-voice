@@ -13,7 +13,11 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import type { CaptureCommand, SpeechToText, SpeechToTextSession, TranscriptChunk } from '@axon/core';
-import { WakeWordDetector } from '../src/main/wake/wake-word.js';
+import { WakeWordDetector, decideWake, WAKE_ACTIVITY_OPTIONS, WAKE_MIN_CONFIDENCE } from '../src/main/wake/wake-word.js';
+import { VoiceActivityDetector } from '../src/main/voice/vad.js';
+
+/** The activity detector the runtime hands the wake word, configured the same way. */
+const activity = (): VoiceActivityDetector => new VoiceActivityDetector(WAKE_ACTIVITY_OPTIONS);
 import { MicGate } from '../src/main/voice/mic-gate.js';
 import { CaptureTransport } from '../src/main/voice/capture-transport.js';
 
@@ -59,6 +63,19 @@ function fakeStt(options: { available?: boolean; failStart?: boolean } = {}) {
   };
 }
 
+/** A frame of speech-loud audio: a 220Hz tone at a normal speaking level. */
+function tone(samples = 1024): Int16Array {
+  const frame = new Int16Array(samples);
+  for (let i = 0; i < samples; i += 1) frame[i] = Math.round(Math.sin((2 * Math.PI * 220 * i) / 16_000) * 8_000);
+  return frame;
+}
+
+/** Let promise callbacks run. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function detector(overrides: Partial<Parameters<typeof makeOptions>[0]> = {}) {
   return makeOptions(overrides);
 }
@@ -73,6 +90,7 @@ function makeOptions(options: {
 
   const instance = new WakeWordDetector({
     stt: options.stt ?? null,
+    activity,
     windowMs: options.windowMs,
     onWake: () => wakes.push(Date.now()),
     onArmedChanged: (armed) => armedChanges.push(armed),
@@ -201,14 +219,19 @@ describe('hearing the phrase', () => {
 
 describe('audio handling', () => {
   it('forwards frames to the local recognizer only', async () => {
+    // Speech, not silence: since the wake word segments utterances, silence
+    // reaches no recognizer at all (see "segmenting speech" below). What this
+    // still asserts is the destination — the recognizer the detector owns,
+    // and nothing else.
     const fake = fakeStt();
     const d = detector({ stt: fake.stt });
     await d.instance.arm();
 
-    d.instance.pushFrame(new Int16Array(1024));
-    d.instance.pushFrame(new Int16Array(1024));
+    for (let i = 0; i < 6; i += 1) d.instance.pushFrame(new Int16Array(1024));
+    for (let i = 0; i < 8; i += 1) d.instance.pushFrame(tone());
+    await settle();
 
-    expect(fake.sessions[0]?.pushed).toBe(2);
+    expect(fake.sessions[0]?.pushed).toBeGreaterThan(0);
   });
 
   it('drops a frame when not armed', async () => {
@@ -268,6 +291,215 @@ describe('recycling the recognition window', () => {
       expect(fake.sessions).toHaveLength(1);
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Segmenting speech — the fix for a wake word that did not work.
+// ---------------------------------------------------------------------------
+
+/** A detector on a controllable clock, collecting everything it reports. */
+async function clocked(options: { debug?: boolean } = {}) {
+  const fake = fakeStt();
+  let t = 1_000;
+  const wakes: number[] = [];
+  const lines: string[] = [];
+  const instance = new WakeWordDetector({
+    stt: fake.stt,
+    activity,
+    onWake: () => wakes.push(t),
+    onArmedChanged: () => {},
+    onNotice: () => {},
+    now: () => t,
+    ...(options.debug ? { debug: (line: string) => lines.push(line) } : {}),
+  });
+  await instance.arm();
+  const push = (frame: Int16Array, count: number): void => {
+    for (let i = 0; i < count; i += 1) {
+      t += 64;
+      instance.pushFrame(frame);
+    }
+  };
+  return { fake, instance, wakes, lines, push, advance: (ms: number) => { t += ms; } };
+}
+
+describe('segmenting speech', () => {
+  it('sends silence to no recognizer at all', async () => {
+    const r = await clocked();
+    r.push(new Int16Array(1024), 60);
+    await settle();
+    expect(r.fake.sessions.every((session) => session.pushed === 0)).toBe(true);
+  });
+
+  it('hands one spoken utterance, with the moment before it, to a warm recognizer and ends it', async () => {
+    // THE BUG THIS REPLACES: audio went into a sixty-second window that was
+    // only recognised when it closed, and was dropped after twenty-five
+    // seconds. Now an utterance is recognised as soon as the speaker pauses.
+    const r = await clocked();
+    r.push(new Int16Array(1024), 8); // the room
+    r.push(tone(), 12); // "hey axon"
+    r.push(new Int16Array(1024), 12); // a pause
+    await settle();
+
+    const used = r.fake.sessions[0];
+    expect(used?.pushed).toBeGreaterThan(12); // the speech, plus the pre-roll before its onset
+    expect(used?.ended).toBe(true);
+  });
+
+  it('warms the next recognizer while the first is busy', async () => {
+    const r = await clocked();
+    r.push(new Int16Array(1024), 8);
+    r.push(tone(), 12);
+    await settle();
+    expect(r.fake.sessions.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('cuts continuous sound at the utterance ceiling rather than listening forever', async () => {
+    const r = await clocked();
+    r.push(new Int16Array(1024), 8);
+    r.push(tone(), 60); // ~3.8s of sound with no pause
+    await settle();
+    expect(r.fake.sessions[0]?.ended).toBe(true);
+  });
+
+  it('never joins audio across a gap in the capture', async () => {
+    // The microphone was lent to a conversation and given back: the half an
+    // utterance before the gap and the audio after it are not one phrase.
+    const r = await clocked();
+    r.push(new Int16Array(1024), 8);
+    r.push(tone(), 6);
+    await settle();
+    r.advance(5_000);
+    r.push(new Int16Array(1024), 2);
+    await settle();
+    expect(r.fake.sessions[0]?.closed).toBe(true);
+    expect(r.fake.sessions[0]?.ended).toBe(false);
+  });
+
+  it('asks the recognizer for the wake grammar, not free dictation', async () => {
+    const modes: (string | undefined)[] = [];
+    const stt: SpeechToText = {
+      name: 'mode-recorder',
+      sampleRate: 16_000,
+      isAvailable: () => true,
+      start: (_onChunk, options) => {
+        modes.push(options?.mode);
+        return Promise.resolve({ push: () => {}, end: () => Promise.resolve(), close: () => {} });
+      },
+    };
+    const instance = new WakeWordDetector({ stt, activity, onWake: () => {}, onArmedChanged: () => {}, onNotice: () => {} });
+    await instance.arm();
+    expect(modes).toEqual(['wake']);
+    instance.disarm();
+  });
+
+  it('closes every recognizer it opened when disarmed, including the busy one', async () => {
+    const r = await clocked();
+    r.push(new Int16Array(1024), 8);
+    r.push(tone(), 6);
+    await settle();
+    r.instance.disarm();
+    await settle();
+    expect(r.fake.sessions.every((session) => session.closed)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deciding — only the wake grammar, confidently, wakes Axon.
+// ---------------------------------------------------------------------------
+
+describe('deciding whether a result wakes Axon', () => {
+  const chunk = (text: string, source: TranscriptChunk['source'], confidence: number | null = 0.8) => ({
+    text,
+    isFinal: true,
+    confidence,
+    ...(source ? { source } : {}),
+  });
+
+  it('wakes on each wake phrase from the wake grammar', () => {
+    for (const phrase of ['hey axon', 'hello axon', 'hi axon']) {
+      expect(decideWake(chunk(phrase, 'wake-phrase')).wake, phrase).toBe(true);
+    }
+  });
+
+  it('does not wake on a wake-grammar result below the confidence floor', () => {
+    expect(decideWake(chunk('hey axon', 'wake-phrase', WAKE_MIN_CONFIDENCE - 0.01)).wake).toBe(false);
+    expect(decideWake(chunk('hey axon', 'wake-phrase', WAKE_MIN_CONFIDENCE)).wake).toBe(true);
+  });
+
+  it('never wakes on ordinary dictated speech that mentions the name', () => {
+    for (const heard of [
+      'I was talking about axon yesterday',
+      'axon',
+      'hey',
+      'hello',
+      'hi',
+      'hey axon how are you', // a sentence, not the phrase
+      'a exxon', // what dictation made of "Hey Axon" — the grammar handles that, not a looser match
+      'hey axin',
+      'hey axton',
+    ]) {
+      expect(decideWake(chunk(heard, 'dictation')).wake, heard).toBe(false);
+    }
+  });
+
+  it('wakes on dictation only when the whole utterance is exactly a wake phrase', () => {
+    expect(decideWake(chunk('Hey, Axon!', 'dictation')).wake).toBe(true);
+    expect(decideWake(chunk('hello axon', 'dictation', 0.2)).wake).toBe(false);
+  });
+
+  it('never wakes on an interim result, whatever it says', () => {
+    expect(decideWake({ text: 'hey axon', isFinal: false, confidence: 0.99, source: 'wake-phrase' }).wake).toBe(false);
+  });
+
+  it('rejects a wake-grammar result that is not one of the three phrases', () => {
+    expect(decideWake(chunk('hey there', 'wake-phrase')).wake).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Debug mode — enough to answer "what did Windows hear?", and nothing more.
+// ---------------------------------------------------------------------------
+
+describe('wake-word debug mode', () => {
+  it('says nothing unless it was asked to', async () => {
+    const r = await clocked();
+    r.push(new Int16Array(1024), 8);
+    r.push(tone(), 12);
+    r.push(new Int16Array(1024), 12);
+    r.fake.hear('hey axon');
+    await settle();
+    expect(r.lines).toEqual([]);
+  });
+
+  it('reports the microphone, the utterance, what was heard and the decision', async () => {
+    const r = await clocked({ debug: true });
+    r.push(new Int16Array(1024), 8);
+    r.push(tone(), 12);
+    r.push(new Int16Array(1024), 12);
+    await settle();
+    r.fake.hear('Hey, Axon!');
+    await settle();
+
+    const log = r.lines.join('\n');
+    expect(log).toMatch(/local recognizer ready/);
+    expect(log).toMatch(/microphone audio is arriving/);
+    expect(log).toMatch(/speech started/);
+    expect(log).toMatch(/utterance of \d+ms handed to the local recognizer/);
+    expect(log).toMatch(/heard \[text \?\] "Hey, Axon!" -> "hey axon" -> ACTIVATE/);
+    expect(r.wakes).toHaveLength(1);
+  });
+
+  it('never prints audio', async () => {
+    const r = await clocked({ debug: true });
+    r.push(tone(), 100);
+    await settle();
+    // No run of sample values, and no line long enough to be carrying a buffer.
+    for (const line of r.lines) {
+      expect(line).not.toMatch(/-?\d{3,}\s*,\s*-?\d{3,}\s*,/);
+      expect(line.length).toBeLessThan(300);
     }
   });
 });

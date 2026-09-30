@@ -22,6 +22,7 @@ import { APPROVAL_DECISIONS } from './approval.js';
 import { SIDE_EFFECT_CLASSES } from './agent.js';
 import { VOICE_ACTIVATIONS, VOICE_AGENT_PHASES } from './voice-agent.js';
 import { JsonValueSchema } from './json.js';
+import { TOOL_FAILURE_KINDS } from './tool-contract.js';
 
 export const AXON_EVENT_TYPES = [
   'STATE_CHANGED',
@@ -98,19 +99,9 @@ const ApprovalRequestSchema = z.object({
 });
 
 const ToolFailureSchema = z.object({
-  kind: z.enum([
-    'UNKNOWN_TOOL',
-    'INVALID_INPUT',
-    'FORBIDDEN',
-    'DENIED',
-    'APPROVAL_TIMEOUT',
-    'CANCELLED',
-    'EXECUTION_ERROR',
-    'STALE_REFERENCE',
-    'BUDGET_EXCEEDED',
-    'DUPLICATE_SIDE_EFFECT',
-    'APPROVAL_MISMATCH',
-  ]),
+  // Derived, never listed twice: a kind added to the contract but not here
+  // would make every event carrying it fail validation and vanish.
+  kind: z.enum(TOOL_FAILURE_KINDS),
   message: z.string(),
   detail: JsonValueSchema.nullable(),
 });

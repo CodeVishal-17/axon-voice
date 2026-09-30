@@ -18,6 +18,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const { app } = require('electron');
+const { TASK_LIMITS, VOICE_AGENT_LIMITS } = require('@axon/core');
 
 const checks = [];
 let failed = 0;
@@ -95,10 +96,13 @@ async function main() {
     'browser.scroll',
     'browser.type',
     'fs.write',
+    'keyboard.type',
     'memory.forget',
     'memory.save',
     'memory.search',
     'system.screenshot',
+    'system.time',
+    'ui.click',
     'window.focus',
     'window.list',
     'window.maximize',
@@ -121,16 +125,66 @@ async function main() {
     !schemas.some((s) => JSON.stringify(s).includes('function')),
   );
 
-  // --- system.screenshot (real capture) ----------------------------------
-  const shot = await orchestrator.invokeTool('system.screenshot', { label: 'verify' });
+  // --- system.time (the real clock) --------------------------------------
+  const clock = await orchestrator.invokeTool('system.time', {});
+  check('system.time succeeded', clock.ok, clock.ok ? `${clock.output.date} ${clock.output.time}` : '');
+  if (clock.ok) {
+    // Against THIS process's clock, not against a value the tool was handed.
+    check('system.time agrees with this machine', Math.abs(clock.output.epochMs - Date.now()) < 5000);
+    check('system.time reports the real UTC offset', clock.output.utcOffsetMinutes === -new Date().getTimezoneOffset());
+  }
+  const invented = await orchestrator.invokeTool('system.time', { now: '1999-01-01T00:00:00.000Z' });
+  check(
+    'a caller cannot tell system.time what time it is',
+    invented.ok && !invented.output.date.startsWith('1999'),
+    invented.ok ? invented.output.date : '',
+  );
+
+  // --- system.screenshot (a real look at a real screen) -------------------
+  // Looking no longer writes a file. What it produces is an observation: the
+  // size of the screen, the window in front, and the controls Axon read out of
+  // the accessibility layer, each with a reference that expires.
+  const shot = await orchestrator.invokeTool('system.screenshot', {});
   check('system.screenshot succeeded', shot.ok, shot.ok ? '' : JSON.stringify(shot.failure));
   if (shot.ok) {
-    const stat = fs.existsSync(shot.output.path) ? fs.statSync(shot.output.path) : null;
-    const header = stat ? fs.readFileSync(shot.output.path).subarray(0, 8) : Buffer.alloc(0);
-    check('screenshot file exists on disk', stat !== null, shot.output.path);
-    check('screenshot is a real PNG', header.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])));
-    check('screenshot has real dimensions', shot.output.width > 100 && shot.output.height > 100, `${shot.output.width}x${shot.output.height}`);
-    check('screenshot is more than a stub', stat !== null && stat.size > 5000, stat ? `${stat.size} bytes` : '');
+    check('it minted a visual observation', /^v\d+$/.test(String(shot.output.observation)), String(shot.output.observation));
+    check('it read a real screen', shot.output.width > 100 && shot.output.height > 100, `${shot.output.width}x${shot.output.height}`);
+    check('it saved nothing, because nobody asked for a file', shot.output.saved === null);
+    check(
+      'looking left no file behind',
+      !fs.existsSync(config.screenshotDir) || fs.readdirSync(config.screenshotDir).length === 0,
+    );
+    // BOTH facts, in that order. A payload whose most prominent sentence is
+    // about what Axon cannot do gets read as a failure — that is exactly what
+    // happened in a live test, with Axon answering "I could not capture a
+    // screenshot" to a capture that had succeeded.
+    check('the result states the capture succeeded', shot.output.captured === true && /SUCCEEDED/.test(String(shot.output.note)));
+    check('and states the provider limitation, second', /cannot send you the picture/i.test(String(shot.output.note)));
+
+    const serialized = JSON.stringify(shot.output);
+    check('no filesystem path reached the model', !serialized.includes(config.screenshotDir));
+    check('no window handle or automation id reached the model', !/"(handle|windowHandle|automationId)"/.test(serialized));
+    check('no coordinate reached the model', !/"(x|y|left|top|bounds|rect)"/.test(serialized));
+
+    const targets = Array.isArray(shot.output.targets) ? shot.output.targets : [];
+    check(
+      'every target is a reference and a name',
+      targets.every((t) => /^t\d+$/.test(t.ref) && typeof t.name === 'string'),
+      `${targets.length} targets on "${shot.output.foregroundWindow}"`,
+    );
+  }
+
+  // --- saving is a separate, explicit act --------------------------------
+  const saved = await orchestrator.invokeTool('system.screenshot', { label: 'verify', save: true });
+  check('system.screenshot saved a file when asked', saved.ok && saved.output.saved !== null);
+  if (saved.ok && saved.output.saved) {
+    const file = path.join(config.screenshotDir, saved.output.saved.file);
+    const stat = fs.existsSync(file) ? fs.statSync(file) : null;
+    const header = stat ? fs.readFileSync(file).subarray(0, 8) : Buffer.alloc(0);
+    check('the saved screenshot exists on disk', stat !== null, file);
+    check('the saved screenshot is a real PNG', header.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])));
+    check('the saved screenshot is more than a stub', stat !== null && stat.size > 5000, stat ? `${stat.size} bytes` : '');
+    check('the model was given a file name, not a path', !saved.output.saved.file.includes(path.sep));
   }
 
   // --- screenshot retention ----------------------------------------------
@@ -139,10 +193,100 @@ async function main() {
   {
     const before = fs.existsSync(config.screenshotDir) ? fs.readdirSync(config.screenshotDir).length : 0;
     for (let i = 0; i < 15; i += 1) {
-      await orchestrator.invokeTool('system.screenshot', { label: `retain ${i}` });
+      await orchestrator.invokeTool('system.screenshot', { label: `retain ${i}`, save: true });
     }
     const after = fs.readdirSync(config.screenshotDir).filter((name) => /^screen-.*\.png$/.test(name));
     check('old screenshots are pruned rather than kept forever', after.length <= 12, `${before} -> ${after.length} files after 16 captures`);
+  }
+
+  // --- a target Axon did not mint cannot be acted on ----------------------
+  for (const ref of ['t9999', '940,512', '65536', '#submit']) {
+    const refused = await orchestrator.invokeTool('ui.click', { ref, action: 'invoke' });
+    check(
+      `ui.click refuses "${ref}"`,
+      !refused.ok && (refused.failure.kind === 'STALE_REFERENCE' || refused.failure.kind === 'INVALID_INPUT'),
+      refused.ok ? 'IT CLICKED' : refused.failure.kind,
+    );
+  }
+
+  // --- how long a tool actually takes, against the voice budget -----------
+  // THE STATIC TEST ASSERTS THE CONSTANTS; THIS ASSERTS REALITY.
+  //
+  // A tool that outlives the voice provider's tool timeout is abandoned on the
+  // wire, and the model then reports a failure for work that succeeded — it
+  // told a user "GitHub did not load" about a page on their screen. The
+  // deadlines are set to fit; whether the real thing fits inside them, on a
+  // real machine with a real accessibility tree, is a different question and
+  // it can only be answered by measuring.
+  {
+    const budgetMs = 15_000; // VOICE_AGENT_LIMITS.toolTimeoutSeconds
+    const timed = async (tool, input) => {
+      const startedAt = Date.now();
+      const result = await orchestrator.invokeTool(tool, input);
+      return { ms: Date.now() - startedAt, result };
+    };
+
+    const look = await timed('system.screenshot', {});
+    check(
+      'a look at the screen finishes inside the voice provider budget',
+      look.ms < budgetMs,
+      `${look.ms}ms of ${budgetMs}ms`,
+    );
+
+    const clockCall = await timed('system.time', {});
+    check('system.time is effectively instant', clockCall.ms < 500, `${clockCall.ms}ms`);
+
+    // --- the numbers the progress threshold is set from ------------------
+    // "Opening YouTube." before a real pause is helpful. The same sentence
+    // before something that finishes in a second is filler. The threshold
+    // between those is not a matter of taste — it is a measurement, and this
+    // is where it is taken.
+    const launch = await timed('app.open', { app: 'calculator' });
+    check(
+      'app.open is fast enough to answer in one sentence',
+      launch.result.ok && launch.ms < TASK_LIMITS.inlineBudgetMs,
+      `${launch.ms}ms (threshold ${TASK_LIMITS.inlineBudgetMs}ms -> ${
+        launch.ms >= TASK_LIMITS.inlineBudgetMs ? 'announces' : 'silent'
+      })`,
+    );
+    // NOT asserted as "it announces". A faster machine may well read the
+    // accessibility tree inside the threshold, and answering in one sentence
+    // is the better outcome when it can. What is asserted is that the
+    // measurement was taken and the threshold is the thing deciding.
+    check(
+      'a screen observation was timed against the threshold',
+      look.result.ok,
+      `${look.ms}ms vs ${TASK_LIMITS.inlineBudgetMs}ms -> ${
+        look.ms >= TASK_LIMITS.inlineBudgetMs ? 'announces' : 'silent'
+      }`,
+    );
+    check(
+      'the announce threshold leaves room inside the provider tool timeout',
+      TASK_LIMITS.inlineBudgetMs + 2000 <= VOICE_AGENT_LIMITS.toolTimeoutSeconds * 1000,
+      `announce-after ${TASK_LIMITS.inlineBudgetMs}ms, wire ${VOICE_AGENT_LIMITS.toolTimeoutSeconds * 1000}ms`,
+    );
+  }
+
+  // --- a credential is refused however it arrives -------------------------
+  // Against a REAL editable field where the screen has one, so the refusal is
+  // the credential rule rather than an unresolvable reference. Where no field
+  // is on screen the reference rule is what is exercised instead, and the
+  // label says which happened.
+  {
+    const look = await orchestrator.invokeTool('system.screenshot', {});
+    const field = look.ok ? (look.output.targets || []).find((t) => t.actions.includes('setText')) : null;
+    const credential = await orchestrator.invokeTool('keyboard.type', {
+      ref: field ? field.ref : 't99999',
+      text: 'ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    });
+    check(
+      field
+        ? 'keyboard.type refuses a credential into a real field, without asking'
+        : 'keyboard.type refuses an unresolvable target (no editable field was on screen)',
+      !credential.ok && credential.failure.kind === (field ? 'FORBIDDEN' : 'STALE_REFERENCE'),
+      credential.ok ? 'IT TYPED A TOKEN' : credential.failure.kind,
+    );
+    check('the refusal did not echo the credential', !JSON.stringify(credential).includes('ghp_AAAA'));
   }
 
   // --- fs.write SAFE -----------------------------------------------------
@@ -458,7 +602,14 @@ async function main() {
 
   // --- summary ------------------------------------------------------------
   console.log(`\n${checks.length - failed}/${checks.length} checks passed`);
-  fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  try {
+    fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch {
+    // Disposable. Windows keeps a handle on a database or a capture for a
+    // moment after the process that opened it is done, and a temp directory
+    // that outlives the run by a few seconds must not fail a verification
+    // that passed. `verify-desktop.cjs` has always done it this way.
+  }
   app.exit(failed === 0 ? 0 : 1);
 }
 

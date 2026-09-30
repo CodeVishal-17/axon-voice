@@ -552,13 +552,18 @@ describe('the renderer is given no new authority', () => {
     'utf8',
   );
 
-  it('exposes exactly the five listening members and no more', () => {
+  it('exposes exactly the six listening members and no more', () => {
+    // The sixth, `reportCaptureDiagnostics`, was added to find out why a human's
+    // speech was transcribed wrongly. It carries no audio and no authority: a
+    // strict object of format, timing and loudness NUMBERS, fire-and-forget, from
+    // the voice surface only, printed to a developer console only when a
+    // development build asked for it with AXON_VOICE_DEBUG or AXON_WAKE_DEBUG.
     const members = [...ipc.matchAll(/^\s{2}(\w+)[(<]/gm)].map((m) => m[1]);
     const listeningMembers = members.filter((m) =>
       /listen|capture|audioFrame/i.test(m ?? ''),
     );
     expect(listeningMembers.sort()).toEqual(
-      ['onCaptureCommand', 'reportCapture', 'sendAudioFrame', 'startListening', 'stopListening'].sort(),
+      ['onCaptureCommand', 'reportCapture', 'reportCaptureDiagnostics', 'sendAudioFrame', 'startListening', 'stopListening'].sort(),
     );
   });
 

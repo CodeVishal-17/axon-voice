@@ -15,6 +15,8 @@
 import { spawn } from 'node:child_process';
 import { desktopCapturer, screen, shell } from 'electron';
 import type { AppLauncher, CapturedScreen, LaunchedApp, ScreenCapturer } from './ports.js';
+// The one definition of what may reach explorer; see `app-catalog.ts`.
+import { isLaunchableAppId } from '../apps/app-catalog.js';
 
 export class ElectronAppLauncher implements AppLauncher {
   launchExecutable(file: string): Promise<LaunchedApp> {
@@ -39,7 +41,53 @@ export class ElectronAppLauncher implements AppLauncher {
   async openUri(uri: string): Promise<void> {
     await shell.openExternal(uri);
   }
+
+  /**
+   * Start a Start-menu application by its AppID.
+   *
+   * MEASURED, NOT ASSUMED. `shell.openExternal('shell:AppsFolder\\<AppID>')`
+   * was tried first and rejected by Windows ("The system cannot find the path
+   * specified") — the URL is canonicalised on the way. `explorer.exe` given
+   * that path as its ONE argument launches it, the same way the Start menu
+   * does, for desktop programs and Store packages alike.
+   *
+   * THE SHAPE IS STILL THE SECURITY:
+   *
+   *   - `explorer.exe` is a constant. The AppID is never the program.
+   *   - One argument, always prefixed `shell:AppsFolder\`, so it is a
+   *     namespace path to explorer and never a switch (`/select,` and the like
+   *     would need to BE the argument, and this one cannot start with `/`).
+   *   - No shell, so nothing in it is ever parsed as syntax.
+   *   - The AppID is re-validated here even though the catalog already did:
+   *     this is the last line before a process starts.
+   *
+   * NOT DETACHED, deliberately, and also measured: explorer started detached
+   * exits without launching anything. It does not need to be — it hands the
+   * request to the running shell and exits at once, so the application is
+   * the shell's child, never Axon's.
+   *
+   * Resolves once explorer has started. Explorer's exit code says nothing
+   * about success (it is 1 either way), which is why the caller VERIFIES by
+   * looking for the window.
+   */
+  launchStartMenuApp(appId: string): Promise<void> {
+    if (!isLaunchableAppId(appId)) {
+      return Promise.reject(new Error('That application identifier is not one Axon will launch.'));
+    }
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn('explorer.exe', [`shell:AppsFolder\\${appId}`], {
+        stdio: 'ignore',
+        windowsHide: false,
+      });
+      child.once('error', reject);
+      child.once('spawn', () => {
+        child.unref();
+        resolve();
+      });
+    });
+  }
 }
+
 
 export class ElectronScreenCapturer implements ScreenCapturer {
   async capturePrimaryDisplay(): Promise<CapturedScreen> {

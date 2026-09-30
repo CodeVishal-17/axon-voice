@@ -116,6 +116,18 @@ export function useAxonRuntime(): AxonRuntime {
     active: false,
     phase: 'IDLE',
     armed: false,
+    // Before the first snapshot arrives the renderer knows nothing about the
+    // wake detector, and "disabled" is the honest thing to draw: an interface
+    // that shows a microphone as armed before main has said so is the one
+    // mistake this status exists to prevent.
+    wake: {
+      engine: 'disabled',
+      detail: 'not yet reported',
+      available: false,
+      unavailableReason: null,
+      restarts: 0,
+      starvedOfAudio: false,
+    },
   });
   const [browser, setBrowser] = useState<BrowserStatus>({
     available: false,

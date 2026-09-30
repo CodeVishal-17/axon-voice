@@ -33,9 +33,11 @@ import type {
   AxonSnapshot,
   AxonState,
   CaptureCommand,
+  CaptureDiagnostics,
   CaptureReport,
   JsonValue,
   MemoryEntry,
+  PlaybackDiagnostics,
   SendMessageResult,
   SessionRecord,
   SettingsUpdateResult,
@@ -47,6 +49,8 @@ import type {
   ToolResult,
   ToolSchema,
   VoiceSessionResult,
+  OverlayPhase,
+  StartupStatus,
 } from '@axon/core';
 
 const bridge: AxonBridge = {
@@ -81,6 +85,13 @@ const bridge: AxonBridge = {
 
   requestState(to: AxonState, reason: string): Promise<StateRequestResult> {
     return ipcRenderer.invoke(IPC_CHANNELS.STATE_REQUEST, { to, reason }) as Promise<StateRequestResult>;
+  },
+
+  setAppearance(appearance: 'dark' | 'light'): Promise<void> {
+    // Rebuilt as a literal, so nothing but the one word crosses.
+    return ipcRenderer.invoke(IPC_CHANNELS.WINDOW_APPEARANCE, {
+      appearance: appearance === 'light' ? 'light' : 'dark',
+    }) as Promise<void>;
   },
 
   sendMessage(text: string): Promise<SendMessageResult> {
@@ -136,6 +147,24 @@ const bridge: AxonBridge = {
     });
   },
 
+  reportPlaybackDiagnostics(report: PlaybackDiagnostics): void {
+    // Rebuilt field by field, a string id, a fixed word, two numbers and a
+    // short reason, so nothing else a page attached to the object crosses.
+    // `send`: fire and forget, no reply to learn anything from.
+    // Literals rather than core's constants: this file imports VALUES only
+    // from `@axon/core/ipc`, so the bridge stays the small audited object it
+    // is. Main validates the same bounds strictly on arrival.
+    const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0);
+    const events: readonly string[] = ['received', 'started', 'ended', 'failed'];
+    ipcRenderer.send(IPC_CHANNELS.SPEECH_PLAYBACK_DIAGNOSTICS, {
+      speechId: typeof report.speechId === 'string' ? report.speechId.slice(0, 64) : '',
+      event: events.includes(report.event) ? report.event : 'failed',
+      chunks: num(report.chunks),
+      bytes: num(report.bytes),
+      reason: typeof report.reason === 'string' ? report.reason.slice(0, 120) : null,
+    });
+  },
+
   async cancelSpeech(): Promise<void> {
     await ipcRenderer.invoke(IPC_CHANNELS.SPEECH_CANCEL);
   },
@@ -176,6 +205,33 @@ const bridge: AxonBridge = {
     // `send`, not `invoke`: no reply, so nothing about what main heard — or
     // about whether this capture id is the live one — comes back through here.
     ipcRenderer.send(IPC_CHANNELS.LISTEN_AUDIO, { captureId, samples });
+  },
+
+  // --- overlay and startup -------------------------------------------------
+
+  onOverlayPhase(listener: (phase: OverlayPhase) => void): () => void {
+    // The event is dropped, as everywhere else, and the payload is narrowed to
+    // one of two words before page code sees it.
+    const handler = (_event: IpcRendererEvent, payload: unknown): void => {
+      listener(payload === 'leave' ? 'leave' : 'enter');
+    };
+    ipcRenderer.on(IPC_CHANNELS.OVERLAY_PHASE, handler);
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.OVERLAY_PHASE, handler);
+    };
+  },
+
+  setOverlayInteractive(interactive: boolean): void {
+    // One boolean, fire and forget.
+    ipcRenderer.send(IPC_CHANNELS.OVERLAY_INTERACTIVE, interactive === true);
+  },
+
+  getStartup(): Promise<StartupStatus> {
+    return ipcRenderer.invoke(IPC_CHANNELS.STARTUP_GET) as Promise<StartupStatus>;
+  },
+
+  setStartup(enabled: boolean): Promise<StartupStatus> {
+    return ipcRenderer.invoke(IPC_CHANNELS.STARTUP_SET, { enabled: enabled === true }) as Promise<StartupStatus>;
   },
 
   // --- persistence --------------------------------------------------------
@@ -245,6 +301,34 @@ const bridge: AxonBridge = {
       ...(patch.displayName !== undefined ? { displayName: patch.displayName } : {}),
       ...(patch.language !== undefined ? { language: patch.language } : {}),
     }) as Promise<AxonProfile>;
+  },
+
+  reportCaptureDiagnostics(report: CaptureDiagnostics): void {
+    // Rebuilt field by field, numbers and booleans only, so nothing else a page
+    // attached to the object crosses. `send`: no reply.
+    const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+    const numOrNull = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+    const boolOrNull = (value: unknown): boolean | null => (typeof value === 'boolean' ? value : null);
+    ipcRenderer.send(IPC_CHANNELS.LISTEN_DIAGNOSTICS, {
+      captureId: typeof report.captureId === 'string' ? report.captureId.slice(0, 64) : '',
+      pipeline: report.pipeline === 'track-processor' ? 'track-processor' : 'script-processor',
+      targetSampleRate: num(report.targetSampleRate),
+      contextSampleRate: num(report.contextSampleRate),
+      trackSampleRate: numOrNull(report.trackSampleRate),
+      trackChannelCount: numOrNull(report.trackChannelCount),
+      echoCancellation: boolOrNull(report.echoCancellation),
+      noiseSuppression: boolOrNull(report.noiseSuppression),
+      autoGainControl: boolOrNull(report.autoGainControl),
+      windowMs: num(report.windowMs),
+      callbacks: num(report.callbacks),
+      producedMs: num(report.producedMs),
+      audioClockMs: num(report.audioClockMs),
+      maxCallbackGapMs: num(report.maxCallbackGapMs),
+      rms: num(report.rms),
+      peak: num(report.peak),
+      silentCallbacks: num(report.silentCallbacks),
+      clippedSamples: num(report.clippedSamples),
+    });
   },
 
   async reportCapture(report: CaptureReport): Promise<void> {

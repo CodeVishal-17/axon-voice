@@ -138,8 +138,16 @@ describe('a page cannot reach anything privileged', () => {
     const tools = code('main/tools/executors/browser.ts');
     // Both risk resolvers consult `browser.describeElement`, which reads the
     // observation Axon stored — never anything supplied with the call.
-    expect(tools).toMatch(/clickRisk\(browser\.describeElement\(input\.ref\)/);
-    expect(tools).toMatch(/typeRisk\(browser\.describeElement\(input\.ref\)/);
+    // Whitespace-insensitive: the call is allowed to be formatted across
+    // lines, and a rule that broke on a line wrap would be a rule about
+    // formatting rather than about where risk comes from.
+    const flattened = tools.replace(/\s+/g, '');
+    expect(flattened).toContain('clickRisk(browser.describeElement(input.ref)');
+    expect(flattened).toContain('typeRisk(browser.describeElement(input.ref)');
+    // The TEXT's class reaches the risk layer too, so credential-shaped text
+    // is refused whatever field it was headed for — and it is the CLASS that
+    // travels, never the string.
+    expect(flattened).toContain('classifyText(input.text).sensitivity');
     // And there is no parameter through which a caller could describe one.
     expect(tools).not.toMatch(/label:\s*z\.|role:\s*z\.|risk:\s*z\./);
   });

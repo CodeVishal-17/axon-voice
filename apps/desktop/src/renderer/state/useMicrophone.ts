@@ -71,6 +71,11 @@ export function useMicrophone(): MicrophoneBinding {
         report('failed', failure);
         captureIdRef.current = null;
       },
+      onDiagnostics: (report) => {
+        // Numbers about format, timing and loudness, for main's developer
+        // console. Dropped by main unless it asked for them.
+        bridge.reportCaptureDiagnostics(report);
+      },
       onAmplitude: (source) => {
         // Smoothed with the same follower speech playback uses, so the orb's
         // response is characteristic of the orb rather than of whichever
@@ -84,7 +89,11 @@ export function useMicrophone(): MicrophoneBinding {
     const offCommand = bridge.onCaptureCommand((command: CaptureCommand) => {
       if (command.action === 'start') {
         captureIdRef.current = command.captureId;
-        void microphone.start(command.sampleRate);
+        void microphone.start(command.sampleRate, {
+          captureId: command.captureId,
+          diagnostics: command.diagnostics === true,
+          ...(command.processing ? { processing: command.processing } : {}),
+        });
         return;
       }
       // 'stop' — from the voice activity detector, a timeout, a cancellation

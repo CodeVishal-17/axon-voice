@@ -55,7 +55,12 @@ import {
 } from '@axon/core';
 import { BROWSER_PARTITION } from '../config.js';
 import { isNavigable } from './url-policy.js';
+import { BrowserError } from './browser-error.js';
 import { buildProgram, CLICK, OBSERVE, SCROLL, TYPE } from './page-script.js';
+
+// Defined in its own Electron-free module so the mapping to Axon's failure
+// kinds can be tested. Re-exported so every existing importer is unchanged.
+export { BrowserError, type BrowserFailureKind } from './browser-error.js';
 
 /**
  * The session partition.
@@ -68,28 +73,6 @@ const PARTITION = BROWSER_PARTITION;
 
 /** A blank page to sit on before anything is loaded. */
 const BLANK = 'about:blank';
-
-export type BrowserFailureKind =
-  | 'NOT_OPEN'
-  | 'REFUSED'
-  | 'NAVIGATION_FAILED'
-  | 'TIMEOUT'
-  | 'ELEMENT_NOT_FOUND'
-  | 'ELEMENT_SENSITIVE'
-  | 'ELEMENT_NOT_EDITABLE'
-  | 'BUDGET_EXCEEDED'
-  | 'CANCELLED'
-  | 'CRASHED';
-
-export class BrowserError extends Error {
-  readonly kind: BrowserFailureKind;
-
-  constructor(kind: BrowserFailureKind, message: string) {
-    super(message);
-    this.name = 'BrowserError';
-    this.kind = kind;
-  }
-}
 
 export interface AxonBrowserOptions {
   /** Injected in tests. */

@@ -151,14 +151,20 @@ const run = (tool: string, input: unknown) =>
 // ---------------------------------------------------------------------------
 
 describe('the default registry', () => {
-  it('registers exactly the three Step 1 tools', () => {
-    expect(fixture.registry.names()).toEqual(['app.open', 'fs.write', 'system.screenshot']);
+  it('registers exactly the tools this fixture supplies dependencies for', () => {
+    // No browser, no persistence, no desktop and no accessibility layer are
+    // wired in here, so their tools must be absent rather than present and
+    // broken. `system.time` needs nothing but a clock, so it is always here.
+    // `web.open` needs only the launcher's `openUri` — the same port `app.open`
+    // uses — so it is here too; `app.launch` needs the Start-menu catalog, which
+    // this fixture does not supply, so it is absent.
+    expect(fixture.registry.names()).toEqual(['app.open', 'fs.write', 'system.screenshot', 'system.time', 'web.open']);
   });
 
   it('projects every tool into a code-free schema for the brain', () => {
     const schemas = toToolSchemas(fixture.registry.list());
 
-    expect(schemas).toHaveLength(3);
+    expect(schemas).toHaveLength(5);
     for (const schema of schemas) {
       expect(schema.inputSchema).toBeTypeOf('object');
       expect(schema.description.length).toBeGreaterThan(10);
@@ -235,19 +241,38 @@ describe('app.open', () => {
 });
 
 describe('system.screenshot', () => {
-  it('captures and writes a real PNG', async () => {
+  it('writes no file unless asked, and hands back a visual observation instead', async () => {
+    // The Phase 2 change. Looking at the screen used to leave a photograph of
+    // whatever the user had open in a folder they had forgotten about, on
+    // every call, whether or not anybody wanted a picture kept.
     const result = await run('system.screenshot', {});
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    const output = result.output as { path: string; bytes: number; width: number };
-    const written = await fs.readFile(output.path);
-
+    const output = result.output as { observation: string; saved: unknown; width: number };
     expect(fixture.capturer.calls).toBe(1);
+    expect(output.observation).toMatch(/^v\d+$/);
+    expect(output.saved).toBeNull();
+    await expect(fs.readdir(fixture.screenshotDir)).rejects.toThrow();
+  });
+
+  it('captures and writes a real PNG when a file was explicitly asked for', async () => {
+    const result = await run('system.screenshot', { save: true });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const output = result.output as { saved: { file: string } };
+    // The model is handed a FILE NAME, never a path. The path is the user's
+    // business and travels in the timeline; a model that never receives one
+    // cannot name one.
+    expect(output.saved.file).toMatch(/^screen-.*\.png$/);
+    expect(JSON.stringify(output)).not.toContain(fixture.screenshotDir);
+
+    const written = await fs.readFile(path.join(fixture.screenshotDir, output.saved.file));
     expect(written.byteLength).toBe(PNG_1PX.byteLength);
     expect(written.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-    expect(path.dirname(output.path)).toBe(fixture.screenshotDir);
   });
 
   it('runs without approval and still records an observation', async () => {
@@ -255,7 +280,7 @@ describe('system.screenshot', () => {
 
     expect(fixture.events.some((e) => e.type === 'APPROVAL_REQUIRED')).toBe(false);
     expect(fixture.events.find((e) => e.type === 'OBSERVATION')).toMatchObject({
-      summary: expect.stringContaining('screenshot'),
+      summary: expect.stringContaining('screen'),
     });
   });
 

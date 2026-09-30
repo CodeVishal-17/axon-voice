@@ -47,6 +47,57 @@ export const BROWSING_LIMITS = {
   maxTypeCharacters: 4_000,
   /** How long a navigation may take before it is abandoned. */
   navigationTimeoutMs: 30_000,
+  /**
+   * How long ONE `browser.open` or `browser.navigate` tool call may take, in
+   * total, before the tool stops waiting and says what it actually knows.
+   *
+   * THE BOUND A REALTIME VOICE AGENT NEEDS, AND WHY IT IS NOT THE ONE ABOVE.
+   *
+   * `navigationTimeoutMs` bounds the `loadURL` promise. It does not bound the
+   * tool: a call also settles, reads, and — when a slow site keeps firing
+   * load events — waits again. A live test watched a single `browser.open`
+   * stay in flight for minutes, until the whole-turn budget killed it. For a
+   * typed assistant that is slow; for one holding a spoken conversation it is
+   * broken, because the person is sitting in silence with no idea whether
+   * anything is happening.
+   *
+   * So the tool gets its own deadline, shorter than the mechanism's, and
+   * crossing it is not a failure — it is the moment Axon stops waiting and
+   * goes to look. See `NAVIGATION_STATUSES`.
+   *
+   * THE NUMBER IS SET BY THE VOICE PROTOCOL, NOT BY TASTE. A live test made
+   * this concrete: at eighteen seconds, plus the verification, the tool
+   * outlasted the voice provider's own tool timeout — so the provider
+   * abandoned the call, the model never saw the result, and it told the user
+   * "GitHub did not load" about a page that had loaded perfectly. A tool that
+   * answers after nobody is listening has not answered.
+   *
+   * So this and `navigationVerifyMs` must SUM to less than
+   * `VOICE_AGENT_LIMITS.toolTimeoutSeconds`, with room for the dispatch
+   * itself. `voice-agent-timing.test.ts` asserts that relationship across
+   * every tool deadline Axon has, because it is the kind of constraint that
+   * is invisible until it is violated in front of a user.
+   */
+  navigationBudgetMs: 9_000,
+  /**
+   * How long the one bounded check after that deadline may take.
+   *
+   * Short, and it is the ONLY thing that happens: one read, no retry of the
+   * navigation, no second chance. A verification that could itself hang would
+   * reintroduce exactly the unbounded wait the deadline just ended.
+   */
+  navigationVerifyMs: 3_000,
+  /**
+   * Attempts at the SAME address in one turn before the tool refuses.
+   *
+   * Two, not three. The turn's generic repeat bound already allows three
+   * identical calls, which is right for an action that might transiently fail
+   * and wrong for a navigation: a site that did not load twice will not load
+   * on the third try inside the same conversation, and the third attempt costs
+   * another budget's worth of a person's patience. Refused non-retryably, so
+   * the model is told to stop rather than encouraged to vary the arguments.
+   */
+  maxNavigationAttemptsPerUrl: 2,
   /** How long a page script (observation, click, type) may take. */
   scriptTimeoutMs: 10_000,
   /**
@@ -60,6 +111,28 @@ export const BROWSING_LIMITS = {
   /** Navigations permitted in one agent turn. */
   maxNavigationsPerTurn: 15,
 } as const;
+
+/**
+ * What a navigation actually achieved, as far as Axon can tell.
+ *
+ * Three answers, and the third is the one that makes the other two honest.
+ *
+ *   SUCCESS        Axon read the page afterwards and is on the host it asked
+ *                  for. Established, not assumed.
+ *   FAILED         the navigation reported an error and the check found Axon
+ *                  is not on that host. Say so and stop.
+ *   STILL_LOADING  the deadline passed and the check could not establish
+ *                  either. The page may yet arrive; Axon does not know.
+ *
+ * A two-valued version of this collapses STILL_LOADING into one of the others,
+ * and both collapses are lies: into SUCCESS it announces a page nobody has
+ * seen, and into FAILED it tells the user something broke while the page loads
+ * in front of them. The third value exists so Axon can say "I do not know
+ * yet", which is frequently the true answer.
+ */
+export const NAVIGATION_STATUSES = ['SUCCESS', 'FAILED', 'STILL_LOADING'] as const;
+
+export type NavigationStatus = (typeof NAVIGATION_STATUSES)[number];
 
 /** Roles Axon reports for an interactive element. A closed set, not the DOM's. */
 export const ELEMENT_ROLES = ['link', 'button', 'textbox', 'checkbox', 'radio', 'select', 'other'] as const;

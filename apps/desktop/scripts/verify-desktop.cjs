@@ -76,7 +76,7 @@ async function main() {
   console.log('\nAxon desktop verification (a real desktop, real windows, real dispatcher)\n');
 
   try {
-    await run(orchestrator, events);
+    await run(orchestrator, events, sandbox);
   } catch (error) {
     check('the harness ran to completion', false, error instanceof Error ? error.message : String(error));
   }
@@ -93,12 +93,22 @@ async function main() {
   app.exit(failed === 0 ? 0 : 1);
 }
 
-async function run(orchestrator, events) {
+async function run(orchestrator, events, sandbox) {
   const dispatch = (tool, input) => orchestrator.invokeTool(tool, input);
 
   // --- the tools are registered on this platform -------------------------
   const names = orchestrator.registry.names();
-  for (const tool of ['window.list', 'window.focus', 'window.minimize', 'window.maximize', 'app.focus']) {
+  for (const tool of [
+    'window.list',
+    'window.focus',
+    'window.minimize',
+    'window.maximize',
+    'app.focus',
+    'system.time',
+    'system.screenshot',
+    'ui.click',
+    'keyboard.type',
+  ]) {
     check(`${tool} is registered`, names.includes(tool));
   }
 
@@ -140,10 +150,14 @@ async function run(orchestrator, events) {
     const focused = await dispatch('app.focus', { app: 'notepad' });
 
     if (notepadCount > 1) {
+      // ASK, DO NOT GUESS. Phase 3 made the refusal a QUESTION and gave it its
+      // own failure kind, so the distinction survives to what the user hears.
       check(
-        'with two Notepad windows open, Axon refuses rather than guessing which one',
-        !focused.ok && /cannot tell which one/i.test(focused.failure.message),
-        focused.ok ? 'IT PICKED ONE' : focused.failure.message,
+        'with two Notepad windows open, Axon asks which one rather than guessing',
+        !focused.ok &&
+          focused.failure.kind === 'CLARIFICATION_NEEDED' &&
+          /which one do you mean/i.test(focused.failure.message),
+        focused.ok ? 'IT PICKED ONE' : `${focused.failure.kind}: ${focused.failure.message}`,
       );
     } else {
       check('switching to Notepad succeeded', focused.ok, focused.ok ? '' : JSON.stringify(focused.failure));
@@ -224,9 +238,113 @@ async function run(orchestrator, events) {
   const gatedResult = await gated;
   check('denying it means it does not open', !gatedResult.ok && gatedResult.failure.kind === 'DENIED');
 
-  // --- a real screenshot --------------------------------------------------
+  // --- the real clock -----------------------------------------------------
+  const clock = await dispatch('system.time', {});
+  check('system.time read the real clock', clock.ok && Math.abs(clock.output.epochMs - Date.now()) < 5000,
+    clock.ok ? `${clock.output.date} ${clock.output.time} ${clock.output.timezone ?? ''}` : '');
+
+  // --- a real look at a real screen ---------------------------------------
+  // Not a screenshot on disk: an OBSERVATION. Real pixels, and real controls
+  // read out of the operating system's own accessibility layer.
   const shot = await dispatch('system.screenshot', {});
-  check('a real screenshot was captured', shot.ok, shot.ok ? `${shot.output.width}x${shot.output.height}` : '');
+  check('a real screen was captured and read', shot.ok, shot.ok ? `${shot.output.width}x${shot.output.height}` : '');
+
+  let liveRef = null;
+  if (shot.ok) {
+    const targets = Array.isArray(shot.output.targets) ? shot.output.targets : [];
+    check(
+      'real on-screen controls were enumerated',
+      targets.length > 0,
+      `${targets.length} on "${shot.output.foregroundWindow}"`,
+    );
+    check('every one of them has a reference and a name', targets.every((t) => /^t\d+$/.test(t.ref) && t.name.length > 0));
+    check('looking wrote no file, because nobody asked for one', shot.output.saved === null);
+
+    // The negative space, against a real screen: nothing the model receives
+    // could name a control Axon has not looked at.
+    const serialized = JSON.stringify(shot.output);
+    check('no window handle or automation id reached the model', !/"(handle|windowHandle|automationId)"/.test(serialized));
+    check('no coordinate reached the model', !/"(x|y|left|top|bounds|rect)"/.test(serialized));
+    // What must not leak is a path AXON produced. Control names are written by
+    // other applications and one of them may legitimately mention a file, so
+    // scanning untrusted names for path shapes would assert the wrong thing.
+    check('Axon disclosed no path of its own', !serialized.includes(sandbox) && shot.output.saved === null);
+
+    // A control that only moves focus — the one thing safe to do to a real
+    // desktop in an unattended harness.
+    const focusable = targets.find((t) => t.actions.includes('focus') && !t.sensitive);
+    liveRef = focusable ? focusable.ref : null;
+
+    // Control-character hygiene on real control names is covered by the unit
+    // suite; this harness asserts the reference model against a real screen.
+  }
+
+  // --- acting on the real screen, through the real accessibility layer ----
+  if (liveRef) {
+    const focused = await dispatch('ui.click', { ref: liveRef, action: 'focus' });
+    // Moving focus commits to nothing, so it runs without a dialog.
+    //
+    // NOT asserted as "it worked". Which control this picks depends on
+    // whatever window happens to be in front of an unattended machine, and an
+    // application is entitled to refuse focus — a background process calling
+    // `SetFocus` across a process boundary is exactly the kind of thing
+    // Windows declines. That is a restriction imposed on the user's behalf and
+    // Axon does not defeat it.
+    //
+    // What IS asserted is the property that matters, which is the same one the
+    // `SetForegroundWindow` check above asserts: Axon either did it and can
+    // show evidence, or it did not and says so rather than claiming success.
+    if (focused.ok) {
+      check('ui.click focused a real control', true, String(focused.output.verified.summary));
+      check('the outcome was verified against a fresh reading', typeof focused.output.verified.changed === 'boolean');
+      check('acting voided every earlier reference', /take a fresh screenshot/i.test(String(focused.output.note)));
+    } else {
+      check(
+        'the control refused focus, and Axon said so rather than claiming success',
+        /could not act on|no longer on screen|did not accept/i.test(focused.failure.message),
+        `${focused.failure.kind}: ${focused.failure.message}`,
+      );
+    }
+
+    // The same reference, a moment later, is now void — because Axon ACTED.
+    // True whether the control accepted the action or refused it: the screen
+    // is no longer one Axon can vouch for either way, and the invalidation
+    // happens before the outcome is inspected precisely so an early return
+    // cannot leave live references behind.
+    const reused = await dispatch('ui.click', { ref: liveRef, action: 'focus' });
+    check(
+      'a reference from before the action is refused',
+      !reused.ok && reused.failure.kind === 'STALE_REFERENCE',
+      reused.ok ? 'IT CLICKED AGAIN' : reused.failure.kind,
+    );
+  }
+
+  // --- the reference model holds against the real screen ------------------
+  for (const ref of ['t9999', '940,512', '65536']) {
+    const refused = await dispatch('ui.click', { ref, action: 'invoke' });
+    check(
+      `an invented target "${ref}" is refused`,
+      !refused.ok && (refused.failure.kind === 'STALE_REFERENCE' || refused.failure.kind === 'INVALID_INPUT'),
+      refused.ok ? 'IT CLICKED' : refused.failure.kind,
+    );
+  }
+
+  // --- credentials are refused, whatever the field ------------------------
+  {
+    const look = await dispatch('system.screenshot', {});
+    const field = look.ok ? (look.output.targets || []).find((t) => t.actions.includes('setText')) : null;
+    if (field) {
+      const refused = await dispatch('keyboard.type', { ref: field.ref, text: 'ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' });
+      check(
+        'keyboard.type refuses a credential into a real field, without asking',
+        !refused.ok && refused.failure.kind === 'FORBIDDEN',
+        refused.ok ? 'IT TYPED A TOKEN' : refused.failure.kind,
+      );
+      check('no approval was raised for it', events.filter((e) => e.type === 'APPROVAL_REQUIRED' && e.request.tool === 'keyboard.type').length === 0);
+    } else {
+      check('no editable field was on screen to test credential refusal (skipped)', true);
+    }
+  }
 
   // --- nothing leaked -----------------------------------------------------
   const stream = JSON.stringify(events);

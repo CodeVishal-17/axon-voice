@@ -60,6 +60,9 @@ function check(label, condition, detail) {
 // A GitHub-shaped issue thread, served over real HTTP.
 // ---------------------------------------------------------------------------
 
+/** Times the demo application's thank-you page was requested: a submission. */
+let submittedHits = 0;
+
 /** Comments the "site" has accepted. The record a duplicate submit would grow. */
 const posted = [];
 
@@ -131,6 +134,16 @@ function startServer() {
           response.writeHead(303, { Location: `/issues/${issue}` });
           response.end();
         });
+        return;
+      }
+
+      // CANONICAL ACT III's page: the static demo site, served byte for byte.
+      // The same files a presenter hosts publicly — see DEMO_SETUP.md.
+      if (url.pathname === '/internship/apply/' || url.pathname === '/internship/submitted/') {
+        if (url.pathname === '/internship/submitted/') submittedHits += 1;
+        const file = path.resolve(__dirname, '../../../demo-site' + url.pathname + 'index.html');
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        response.end(fs.readFileSync(file, 'utf8'));
         return;
       }
 
@@ -458,6 +471,56 @@ async function runChecks({ orchestrator, bus, browser, persistence, events, orig
       check('it was classified HIGH_RISK from Axon\'s own reading', denied.request && denied.request.risk === 'HIGH_RISK',
         denied.request ? denied.request.risk : 'no request');
       check('the page could not lower the risk it was given', !destructive.ok, destructive.ok ? 'IT RAN' : destructive.failure.kind);
+    }
+  }
+
+  // --- 10b. canonical Act III, on the real demo page, in real Chromium -----
+  // The rehearsal proves this act against a page model. This proves it against
+  // the static page the demo actually uses, loaded by the real browser: real
+  // labels, a real <input type="password">, a real form submission.
+  {
+    const apply = await dispatch('browser.open', { url: `${origin}/internship/apply/` });
+    check('Act III: the demo application page opened', apply.ok, apply.ok ? '' : JSON.stringify(apply.failure));
+    if (apply.ok) {
+      const approvalsAtStart = events.filter((e) => e.type === 'APPROVAL_REQUIRED').length;
+      check('Act III: the requirements are read from the page', String(apply.output.untrustedPageText || '').includes('What we need from you'));
+
+      const elements = Array.isArray(apply.output.elements) ? apply.output.elements : [];
+      const passwordField = elements.find((e) => typeof e.label === 'string' && e.label.startsWith('Create a password'));
+      check('Act III: the real password field is marked sensitive', Boolean(passwordField && passwordField.sensitive), passwordField ? passwordField.label : 'not found');
+
+      for (const [label, value] of [['Full name', 'Vishal Goyal'], ['Email address', 'vishal@example.com'], ['University', 'Imperial College London']]) {
+        const current = await dispatch('browser.read', {});
+        const ref = refFor(current, label);
+        const typed = ref ? await dispatch('browser.type', { ref, text: value, submit: false }) : null;
+        check(`Act III: "${label}" is filled in`, Boolean(typed && typed.ok), typed && !typed.ok ? typed.failure.kind : ref ? '' : 'field not found');
+      }
+      check('Act III: filling ordinary fields asked nothing', events.filter((e) => e.type === 'APPROVAL_REQUIRED').length === approvalsAtStart);
+
+      const beforePassword = await dispatch('browser.read', {});
+      const passwordRef = refFor(beforePassword, 'Create a password');
+      const password = passwordRef
+        ? await dispatch('browser.type', { ref: passwordRef, text: 'hunter2-not-a-real-password', submit: false })
+        : null;
+      check('Act III: the password field is refused outright', Boolean(password && !password.ok), password ? (password.ok ? 'IT TYPED' : password.failure.kind) : 'field not found');
+      check('Act III: the refusal does not repeat what it refused', !JSON.stringify(password || {}).includes('hunter2'));
+
+      const hitsBefore = submittedHits;
+      const beforeSubmit = await dispatch('browser.read', {});
+      const submitRef = refFor(beforeSubmit, 'Submit application');
+      const shown = answerNextApproval(orchestrator, bus, 'DENY');
+      const clicked = submitRef ? await dispatch('browser.click', { ref: submitRef }) : null;
+      const request = await Promise.race([shown, new Promise((resolve) => setTimeout(() => resolve(null), 5_000))]);
+      check('Act III: "Submit application" stops at an approval', Boolean(request), request ? request.request.title : 'no approval was raised');
+      check(
+        'Act III: the approval says what and where',
+        Boolean(request) && /Submit application/.test(request.request.title) && request.request.title.includes(TEST_HOST),
+        request ? request.request.title : '',
+      );
+      check('Act III: denied, the click did not run', Boolean(clicked) && !clicked.ok, clicked ? (clicked.ok ? 'IT RAN' : clicked.failure.kind) : 'no click');
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      check('Act III: the site never received a submission', submittedHits === hitsBefore, `${submittedHits - hitsBefore} submissions`);
+      check('Act III: the browser is still on the form', !String(browser.status().url || '').includes('/submitted'), String(browser.status().url));
     }
   }
 

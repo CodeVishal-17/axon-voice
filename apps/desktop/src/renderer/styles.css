@@ -1,49 +1,112 @@
 /**
  * Axon Voice — visual system.
  *
- * Dark, spatial, restrained. The orb is the only thing allowed to be bright;
- * everything else is hairlines, low-contrast type and negative space, so the
- * eye goes to the one element that carries meaning.
+ * LIQUID GLASS, HAPPY, CALM. Two surfaces share one set of tokens:
  *
- * The state accent is set once, on the root element, and inherited by the
- * timeline markers, the rail and the dock. When Axon changes state the whole
- * interface shifts temperature together rather than lighting up a badge.
+ *   panel     the full window: an ambient, slowly drifting field of colour
+ *             behind translucent glass cards, with the orb at its heart.
+ *   overlay   transparent over the desktop: a small orb at the bottom centre,
+ *             a caption and the current exchange on glass, and soft light along
+ *             the left and right edges.
+ *
+ * One colour per state, set on each surface's root as `--state-rgb` (light:
+ * glow, rings, auras) and `--state-ink` (text), from `state/state-colors.ts` —
+ * the same values the orb draws with, so nothing on screen can disagree about
+ * what Axon is doing. Warm colour is reserved for approval and error.
+ *
+ * Glass here is layered translucency, a bright top edge and soft depth. Real
+ * background blur works inside the panel, over its own ambient field. Over the
+ * desktop, a page cannot see the pixels behind its window, so the overlay's
+ * glass is denser rather than pretending to blur what it cannot.
  */
 
+/* ----------------------------------------------------------------- tokens */
+
 :root {
-  --void: #07080a;
-  --raise: rgba(255, 255, 255, 0.026);
-  --raise-strong: rgba(255, 255, 255, 0.05);
-  --hairline: rgba(255, 255, 255, 0.07);
-  --hairline-soft: rgba(255, 255, 255, 0.04);
+  --bg: #10152a;
+  --glass: rgba(30, 36, 52, 0.52);
+  --glass-strong: rgba(34, 40, 58, 0.74);
+  --glass-edge: rgba(255, 255, 255, 0.13);
+  --glass-shine: rgba(255, 255, 255, 0.2);
+  --overlay-glass: rgba(20, 24, 36, 0.8);
+  --overlay-glass-top: rgba(46, 54, 76, 0.84);
+  --surface: #151a26;
+  --surface-2: #1a2030;
+  --elev: rgba(255, 255, 255, 0.05);
+  --elev-2: rgba(255, 255, 255, 0.09);
+  --line: rgba(255, 255, 255, 0.12);
+  --line-soft: rgba(255, 255, 255, 0.07);
 
-  --text: #e6eaf2;
-  --text-dim: #8a94a6;
-  --text-faint: #59616f;
+  --text: #f2f5fb;
+  --text-dim: #b3bccc;
+  --text-faint: #808a9b;
 
-  --ok: #4fd1c5;
-  --warn: #e0a356;
-  --bad: #e0575b;
+  --ok: #3fd6c1;
+  --warn: #ffb35c;
+  --bad: #ff7d88;
+  --focus: #93bbff;
+  --scrim: rgba(6, 8, 14, 0.46);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.42), 0 2px 8px rgba(0, 0, 0, 0.22);
 
-  --accent: #7c8ca8;
+  --ambient-a: 92 124 255;
+  --ambient-b: 40 204 190;
+  --ambient-c: 196 112 255;
+  /* Dark has more room for colour before it stops being calm. */
+  --ambient-boost: 1.45;
 
-  --titlebar-height: 40px;
-  --rail-width: 384px;
+  --state-rgb: 150 166 198;
+  --state-ink: 150 166 198;
+  --accent: rgb(var(--state-ink));
 
+  --titlebar-height: 44px;
+  --radius-xl: 24px;
+  --radius-l: 18px;
+  --radius-m: 13px;
+  --radius-s: 10px;
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --spring: cubic-bezier(0.2, 0.9, 0.24, 1.18);
+
+  --font: 'Segoe UI Variable Display', 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --mono: 'Cascadia Mono', 'Consolas', ui-monospace, monospace;
 
   color-scheme: dark;
 }
 
-/* One accent per state. Kept here rather than in JS so the CSS transition
-   below can carry the colour change across the whole interface. */
-.state-idle { --accent: #7c8ca8; }
-.state-listening { --accent: #63a4ff; }
-.state-thinking { --accent: #8b8cff; }
-.state-executing { --accent: #4fd1c5; }
-.state-speaking { --accent: #7fd9ff; }
-.state-waiting_for_approval { --accent: #e0a356; }
-.state-error { --accent: #e0575b; }
+:root[data-theme='light'] {
+  --bg: #f3f5fb;
+  --glass: rgba(255, 255, 255, 0.56);
+  --glass-strong: rgba(255, 255, 255, 0.8);
+  --glass-edge: rgba(255, 255, 255, 0.92);
+  --glass-shine: rgba(255, 255, 255, 0.96);
+  --overlay-glass: rgba(250, 251, 255, 0.88);
+  --overlay-glass-top: rgba(255, 255, 255, 0.95);
+  --surface: #ffffff;
+  --surface-2: #f6f8fd;
+  --elev: rgba(34, 44, 76, 0.04);
+  --elev-2: rgba(34, 44, 76, 0.08);
+  --line: rgba(34, 44, 76, 0.12);
+  --line-soft: rgba(34, 44, 76, 0.07);
+
+  --text: #141a27;
+  --text-dim: #4b5468;
+  --text-faint: #7b8497;
+
+  --ok: #0b8878;
+  --warn: #b5650b;
+  --bad: #c33846;
+  --focus: #2c6de0;
+  --scrim: rgba(80, 92, 128, 0.2);
+  --shadow: 0 24px 60px rgba(60, 74, 120, 0.16), 0 2px 8px rgba(60, 74, 120, 0.08);
+
+  --ambient-a: 122 150 255;
+  --ambient-b: 86 222 204;
+  --ambient-c: 255 152 204;
+  --ambient-boost: 1;
+
+  color-scheme: light;
+}
+
+/* ------------------------------------------------------------------- base */
 
 * {
   box-sizing: border-box;
@@ -57,1358 +120,1503 @@ body,
 }
 
 body {
-  background: var(--void);
+  background: var(--bg);
   color: var(--text);
-  font-family: 'Segoe UI Variable Display', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: var(--font);
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
-  /* Nothing in Axon is a document; text selection here is only ever an
-     accident of dragging across the stage. Re-enabled where it is useful. */
   user-select: none;
 }
 
-/* ------------------------------------------------------------------ shell */
+button,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+strong {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ------------------------------------------------------------ panel shell */
 
 .app {
+  position: relative;
+  isolation: isolate;
   display: grid;
-  grid-template-rows: var(--titlebar-height) minmax(0, 1fr) auto;
+  grid-template-rows: var(--titlebar-height) minmax(0, 1fr);
   height: 100%;
-  transition: background 600ms var(--ease);
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* The ambient field: three soft lights drifting slowly behind the glass. */
+.app::before {
+  content: '';
+  position: absolute;
+  inset: -25%;
+  z-index: -2;
   background:
-    radial-gradient(120% 90% at 28% 38%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 62%),
-    radial-gradient(80% 60% at 82% 96%, rgba(255, 255, 255, 0.022), transparent 70%),
-    var(--void);
+    radial-gradient(40% 34% at 22% 18%, rgb(var(--ambient-a) / calc(0.26 * var(--ambient-boost))), transparent 70%),
+    radial-gradient(44% 38% at 82% 30%, rgb(var(--ambient-c) / calc(0.18 * var(--ambient-boost))), transparent 70%),
+    radial-gradient(50% 44% at 48% 88%, rgb(var(--ambient-b) / calc(0.2 * var(--ambient-boost))), transparent 72%);
+  animation: ambient-drift 26s ease-in-out infinite alternate;
+}
+
+/* And the state's own light, gathered around the orb. */
+.app::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: radial-gradient(62% 40% at 50% 44%, rgb(var(--state-rgb) / calc(0.22 * var(--ambient-boost))), transparent 72%);
+  transition: background 700ms var(--ease);
 }
 
 .titlebar {
   -webkit-app-region: drag;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 0 16px;
-  border-bottom: 1px solid var(--hairline-soft);
+  gap: 10px;
+  /* Room for the native minimise / maximise / close buttons Windows paints. */
+  padding: 0 150px 0 14px;
 }
 
-.wordmark {
+.titlebar button,
+.privacy-chip {
+  -webkit-app-region: no-drag;
+}
+
+.privacy-chip {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-edge);
+  background: var(--glass);
+  backdrop-filter: blur(16px) saturate(160%);
   font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.22em;
   color: var(--text-dim);
+  white-space: nowrap;
 }
 
-.wordmark-dot {
+.privacy-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 70%, transparent);
-  transition: background 600ms var(--ease), box-shadow 600ms var(--ease);
+  background: var(--text-faint);
 }
 
-.titlebar-meta {
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-  /* Leave room for the native window controls painted over the title bar. */
-  margin-right: 140px;
+.privacy-armed .privacy-dot {
+  background: var(--ok);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--ok) 70%, transparent);
 }
 
-.stage {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--rail-width);
-  min-height: 0;
+.privacy-live {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
 }
 
-/* -------------------------------------------------------------------- orb */
-
-.orb-stage {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 40px;
-  min-height: 0;
-  padding: 32px;
+.privacy-live .privacy-dot {
+  background: var(--warn);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--warn) 80%, transparent);
+  animation: pulse 1.6s var(--ease) infinite;
 }
 
-.orb-frame {
-  width: min(340px, 42vh);
-  aspect-ratio: 1;
-  flex: 0 0 auto;
-  position: relative;
+.titlebar-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 2px;
 }
 
-/* The canvas is drawn considerably larger than the space the orb occupies in
-   the layout, so the atmospheric glow has room to fall off to nothing inside
-   the element. A canvas sized to the orb clips that falloff at its edges and
-   paints a faint square halo around it. The overflow is transparent and
-   non-interactive, and the caption sits above it. */
-.orb-canvas {
-  display: block;
-  position: absolute;
-  left: -45%;
-  top: -45%;
-  width: 190%;
-  height: 190%;
-  pointer-events: none;
-  z-index: 0;
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-dim);
+  transition: background 160ms var(--ease), color 160ms var(--ease);
 }
 
-.orb-caption {
-  text-align: center;
-  max-width: 460px;
-  /* Above the canvas, which now overflows its box and would otherwise paint
-     over the state label. */
-  position: relative;
-  z-index: 1;
+.icon-button svg {
+  width: 18px;
+  height: 18px;
 }
 
-.state-name {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.34em;
-  text-transform: uppercase;
-  color: var(--accent);
-  transition: color 600ms var(--ease);
-}
-
-.state-copy {
-  margin: 10px 0 0;
-  font-size: 19px;
-  font-weight: 300;
-  letter-spacing: -0.01em;
+.icon-button:hover,
+.icon-button[aria-pressed='true'] {
+  background: var(--glass);
   color: var(--text);
 }
 
-.state-reason {
-  margin: 8px 0 0;
-  font-size: 12.5px;
+/* ------------------------------------------------------------------ stage */
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* Centred while it fits; `safe` keeps the top reachable once it does not. */
+  justify-content: safe center;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 24px 36px;
+  scrollbar-width: thin;
+}
+
+.orb-button {
+  position: relative;
+  flex: none;
+  width: min(72vw, 42vh, 320px);
+  aspect-ratio: 1;
+  margin-top: 10px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  -webkit-app-region: no-drag;
+}
+
+.orb-button:focus-visible {
+  outline-offset: 10px;
+  border-radius: 50%;
+}
+
+.orb-button:disabled {
+  cursor: default;
+}
+
+/* Drawn larger than its box so the glow never clips at the element's edges. */
+.orb-canvas {
+  position: absolute;
+  inset: -16%;
+  width: 132%;
+  height: 132%;
+  pointer-events: none;
+}
+
+/* --------------------------------------------------------------- presence */
+
+.presence {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  max-width: 400px;
+  margin-top: 4px;
+  text-align: center;
+}
+
+.brand {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.42em;
+  text-indent: 0.42em;
   color: var(--text-faint);
 }
 
-/* ------------------------------------------------------------------- rail */
+.presence-lines {
+  margin-top: 10px;
+  min-height: 56px;
+}
 
-.rail {
-  border-left: 1px solid var(--hairline-soft);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.014), transparent 40%);
-  min-height: 0;
+.presence-headline {
+  margin: 0;
+  font-size: 23px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  transition: color 400ms var(--ease);
+}
+
+.presence-headline.tone-active {
+  color: color-mix(in srgb, var(--accent) 45%, var(--text));
+}
+
+.presence-headline.tone-attention {
+  color: var(--warn);
+}
+
+.presence-headline.tone-problem {
+  color: var(--bad);
+}
+
+.presence-detail {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.presence-notice {
+  margin: 8px 0 0;
+  padding: 7px 12px;
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.presence-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.chip-soft {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--glass);
+  border: 1px solid var(--glass-edge);
+  backdrop-filter: blur(16px) saturate(160%);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.chip-soft-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgb(var(--state-rgb));
+}
+
+.pill-button,
+.link-button {
+  border: 1px solid var(--glass-edge);
+  border-radius: 999px;
+  background: var(--glass);
+  backdrop-filter: blur(16px) saturate(160%);
+  padding: 5px 14px;
+  font-size: 12px;
+  color: var(--text);
+  transition: background 160ms var(--ease), transform 160ms var(--ease);
+}
+
+.pill-button:hover,
+.link-button:hover {
+  background: var(--glass-strong);
+}
+
+.link-button {
+  border-color: transparent;
+  background: transparent;
+  backdrop-filter: none;
+  color: var(--text-dim);
+}
+
+.exchange {
   display: flex;
   flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-radius: var(--radius-l);
+  background: linear-gradient(180deg, var(--glass-strong), var(--glass));
+  border: 1px solid var(--glass-edge);
+  box-shadow: inset 0 1px 0 var(--glass-shine), var(--shadow);
+  backdrop-filter: blur(24px) saturate(170%);
+  text-align: left;
+  user-select: text;
+}
+
+.exchange-row {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.exchange-who {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.exchange-axon .exchange-who {
+  color: var(--accent);
+}
+
+.exchange-text {
+  margin: 0;
+  font-size: 14.5px;
+}
+
+.exchange-user .exchange-text {
+  color: var(--text-dim);
+}
+
+.earlier {
+  width: 100%;
+  margin-top: 10px;
+  text-align: left;
+}
+
+.earlier summary {
+  display: inline-block;
+  font-size: 12px;
+  color: var(--text-faint);
+  cursor: pointer;
+  list-style: none;
+}
+
+.earlier summary::-webkit-details-marker {
+  display: none;
+}
+
+.earlier-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  user-select: text;
+}
+
+.earlier-turn {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.stage-foot {
+  width: 100%;
+  max-width: 400px;
+  margin-top: 14px;
+  display: flex;
+  justify-content: center;
+}
+
+/* ---------------------------------------------------------------- composer */
+
+.composer {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  padding: 6px;
+  border-radius: var(--radius-l);
+  background: linear-gradient(180deg, var(--glass-strong), var(--glass));
+  border: 1px solid var(--glass-edge);
+  box-shadow: inset 0 1px 0 var(--glass-shine);
+  backdrop-filter: blur(24px) saturate(170%);
+}
+
+.composer-input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  border: 0;
+  background: transparent;
+  padding: 7px 8px;
+  outline: none;
+  user-select: text;
+}
+
+.composer-send {
+  border: 0;
+  border-radius: var(--radius-m);
+  padding: 0 14px;
+  background: rgb(var(--state-rgb) / 0.22);
+}
+
+.composer-send:disabled {
+  opacity: 0.5;
+}
+
+.composer-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  border-top-color: rgb(var(--state-rgb));
+  animation: spin 900ms linear infinite;
+}
+
+.composer-blocked {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* ---------------------------------------------------------------- activity */
+
+.activity {
+  position: absolute;
+  top: var(--titlebar-height);
+  right: 0;
+  bottom: 0;
+  width: min(380px, 94vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: var(--glass-strong);
+  border-left: 1px solid var(--glass-edge);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(28px) saturate(170%);
+  overflow-y: auto;
+  z-index: 20;
+  animation: slide-in 220ms var(--ease);
 }
 
 .panel-header {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 16px 18px 12px;
-  border-bottom: 1px solid var(--hairline-soft);
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 8px;
 }
 
 .panel-header h2 {
   margin: 0;
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.2em;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--text-dim);
 }
 
 .panel-count,
 .panel-tag {
-  font-size: 10px;
-  letter-spacing: 0.1em;
+  font-size: 11px;
   color: var(--text-faint);
-  border: 1px solid var(--hairline);
-  border-radius: 999px;
-  padding: 1px 8px;
   font-variant-numeric: tabular-nums;
 }
 
-.panel-tag {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
-}
-
-.timeline {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  flex: 1;
-}
-
 .timeline-scroll {
+  max-height: 60vh;
   overflow-y: auto;
-  padding: 8px 0 20px;
-  min-height: 0;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.13) transparent;
-}
-
-.timeline-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
 }
 
 .empty {
+  margin: 6px 4px;
   color: var(--text-faint);
   font-size: 12.5px;
-  padding: 18px;
+}
+
+.timeline-list {
   margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
 .timeline-row {
   display: grid;
-  grid-template-columns: 58px 12px minmax(0, 1fr);
-  align-items: baseline;
-  gap: 6px;
-  padding: 7px 18px 7px 12px;
-  user-select: text;
+  grid-template-columns: 58px 10px 1fr;
+  gap: 8px;
+  padding: 5px 4px;
+  font-size: 12.5px;
 }
 
 .timeline-time {
+  font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.02em;
 }
 
 .timeline-marker {
-  width: 5px;
-  height: 5px;
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
   border-radius: 50%;
   background: var(--text-faint);
-  transform: translateY(-2px);
 }
+
+.tone-ok .timeline-marker { background: var(--ok); }
+.tone-warn .timeline-marker { background: var(--warn); }
+.tone-bad .timeline-marker { background: var(--bad); }
+.tone-accent .timeline-marker { background: var(--accent); }
 
 .timeline-body {
   display: flex;
   flex-direction: column;
-  gap: 1px;
   min-width: 0;
 }
 
 .timeline-label {
-  font-size: 12.5px;
   color: var(--text);
-  letter-spacing: -0.005em;
 }
 
 .timeline-detail {
-  font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   overflow-wrap: anywhere;
 }
 
-.tone-active .timeline-marker { background: var(--accent); }
-.tone-attention .timeline-marker { background: var(--warn); }
-.tone-success .timeline-marker { background: var(--ok); }
-.tone-failure .timeline-marker { background: var(--bad); }
-.tone-attention .timeline-label { color: var(--warn); }
-.tone-failure .timeline-label { color: var(--bad); }
-
-/* State changes are context, not events in their own right, so they read as a
-   quiet rule between the things that actually happened. */
 .timeline-minor {
   display: flex;
-  align-items: center;
   gap: 8px;
-  padding: 3px 18px 3px 70px;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
+  padding: 1px 4px 1px 76px;
+  font-size: 11.5px;
   color: var(--text-faint);
 }
 
-.timeline-minor-label {
-  color: color-mix(in srgb, var(--text-dim) 80%, transparent);
-  white-space: nowrap;
-}
-
-.timeline-minor-detail {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  letter-spacing: 0.04em;
-  text-transform: none;
-  font-size: 10.5px;
-  opacity: 0.62;
-}
-
-/* ------------------------------------------------------------------- dock */
-
-.dock {
-  border-top: 1px solid var(--hairline-soft);
-  background: rgba(255, 255, 255, 0.012);
-}
-
+/* Developer tool console (development builds only). */
 .console {
-  padding: 0 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
 }
 
 .console-group {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
-  padding: 12px 18px 0;
+  gap: 6px;
   align-items: center;
 }
 
 .console-group-label {
-  font-size: 10px;
-  letter-spacing: 0.18em;
+  width: 100%;
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--text-faint);
-  margin-right: 4px;
 }
 
-.chip {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  align-items: flex-start;
-  padding: 7px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--hairline);
-  background: var(--raise);
-  color: var(--text);
-  cursor: pointer;
-  font: inherit;
-  transition: background 160ms var(--ease), border-color 160ms var(--ease), transform 160ms var(--ease);
-}
-
-.chip:hover:not(:disabled) {
-  background: var(--raise-strong);
-  border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline));
-}
-
-.chip:active:not(:disabled) {
-  transform: translateY(1px);
-}
-
-.chip:disabled {
-  opacity: 0.42;
-  cursor: default;
-}
-
-.chip-label {
-  font-size: 12.5px;
-}
-
-.chip-hint {
-  font-size: 10px;
-  color: var(--text-faint);
-  letter-spacing: 0.04em;
-}
-
+.chip,
 .pill {
-  padding: 4px 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
   border-radius: 999px;
-  border: 1px solid var(--hairline);
-  background: transparent;
-  color: var(--text-dim);
-  font: inherit;
-  font-size: 11px;
-  letter-spacing: 0.03em;
-  cursor: pointer;
-  transition: color 160ms var(--ease), border-color 160ms var(--ease);
-}
-
-.pill:hover {
-  color: var(--text);
-  border-color: var(--raise-strong);
+  border: 1px solid var(--line);
+  background: var(--elev);
+  font-size: 11.5px;
 }
 
 .pill-current {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 46%, transparent);
+  border-color: var(--accent);
+}
+
+.chip-hint {
+  color: var(--text-faint);
 }
 
 .console-result {
-  margin: 12px 18px 0;
-  font-size: 11.5px;
-  color: var(--text-dim);
-  font-family: 'Cascadia Mono', 'Consolas', ui-monospace, monospace;
+  margin: 0;
+  padding: 8px;
+  border-radius: var(--radius-s);
+  background: var(--elev);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
   user-select: text;
 }
 
 .console-result-empty {
   color: var(--text-faint);
-  font-style: italic;
-  font-family: inherit;
 }
 
-/* --------------------------------------------------------------- approval */
+/* ---------------------------------------------------------------- approval */
 
 .approval-scrim {
-  position: fixed;
+  position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgba(4, 5, 7, 0.62);
-  backdrop-filter: blur(14px) saturate(0.7);
+  padding: 18px;
+  background: var(--scrim);
+  backdrop-filter: blur(10px) saturate(140%);
   z-index: 40;
-  animation: scrim-in 220ms var(--ease);
+  animation: fade-in 180ms var(--ease);
 }
 
 .approval {
-  width: min(460px, calc(100vw - 64px));
-  padding: 26px 28px 22px;
-  border-radius: 14px;
-  border: 1px solid color-mix(in srgb, var(--warn) 26%, var(--hairline));
-  background: linear-gradient(180deg, rgba(28, 24, 18, 0.96), rgba(12, 12, 14, 0.97));
-  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.02) inset;
-  animation: approval-in 260ms var(--ease);
-}
-
-.approval-risk {
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  color: var(--warn);
-}
-
-.approval-title {
-  margin: 10px 0 18px;
-  font-size: 18px;
-  font-weight: 400;
-  letter-spacing: -0.01em;
-  color: var(--text);
-}
-
-.approval-params {
-  margin: 0 0 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 13px 14px;
-  border-radius: 9px;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid var(--hairline-soft);
-}
-
-.approval-param {
-  display: grid;
-  grid-template-columns: 96px minmax(0, 1fr);
-  gap: 10px;
-  align-items: baseline;
-}
-
-.approval-param dt {
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.approval-param dd {
-  margin: 0;
-  font-size: 12.5px;
-  font-family: 'Cascadia Mono', 'Consolas', ui-monospace, monospace;
-  color: var(--text);
-  overflow-wrap: anywhere;
+  width: min(400px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 22px 22px 16px;
+  border-radius: var(--radius-xl);
+  background: linear-gradient(180deg, var(--glass-strong), var(--glass));
+  border: 1px solid color-mix(in srgb, var(--warn) 42%, var(--glass-edge));
+  box-shadow:
+    inset 0 1px 0 var(--glass-shine),
+    var(--shadow),
+    0 0 0 6px color-mix(in srgb, var(--warn) 9%, transparent);
+  backdrop-filter: blur(28px) saturate(170%);
+  animation: rise-in 260ms var(--ease);
   user-select: text;
 }
 
-.approval-detail {
-  margin: 0 0 20px;
-  font-size: 12.5px;
+.approval-high {
+  border-color: color-mix(in srgb, var(--bad) 55%, var(--glass-edge));
+  box-shadow:
+    inset 0 1px 0 var(--glass-shine),
+    var(--shadow),
+    0 0 0 6px color-mix(in srgb, var(--bad) 10%, transparent);
+}
+
+.approval-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  color: var(--text-faint);
+}
+
+.approval-eyebrow-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--warn) 80%, transparent);
+}
+
+.approval-heading {
+  margin: 10px 0 0;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--text-dim);
 }
 
-/* An outward action says so, above the parameters. The user should know that
-   something is about to leave this machine before they read what it is. */
-.approval-outward {
-  margin: 0 0 14px;
-  padding: 9px 12px;
-  font-size: 12.5px;
-  line-height: 1.5;
-  color: var(--text);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border-left: 2px solid var(--accent);
-  border-radius: 4px;
+.approval-what {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: var(--radius-l);
+  background: var(--elev);
+  border: 1px solid var(--line-soft);
+}
+
+.approval-act {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   overflow-wrap: anywhere;
 }
 
-/* Content the user is being asked to send, shown in full.
-   `pre-wrap` so what is read here and what lands in the field are the same
-   characters in the same order — a paragraph break the user did not see is a
-   paragraph break they did not approve. Scrolls rather than truncates: a long
-   draft stays entirely readable inside a dialog that stays a dialog. */
+.approval-where {
+  margin: 4px 0 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.approval-outward {
+  margin: 12px 0 0;
+  font-size: 12.5px;
+  color: var(--warn);
+}
+
+.approval-warning {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--bad) 13%, transparent);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
 .approval-content {
-  margin: 0 0 16px;
+  margin-top: 12px;
 }
 
 .approval-content-label {
-  margin-bottom: 6px;
   font-size: 10.5px;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--text-faint);
 }
 
 .approval-content-body {
-  max-height: 220px;
-  overflow-y: auto;
+  margin-top: 4px;
   padding: 10px 12px;
-  font-size: 12.5px;
-  line-height: 1.55;
+  border-radius: var(--radius-m);
+  background: var(--elev);
+  border: 1px solid var(--line-soft);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  color: var(--text);
-  background: var(--surface-sunken, rgb(0 0 0 / 22%));
-  border: 1px solid var(--border, rgb(255 255 255 / 8%));
-  border-radius: 6px;
-  user-select: text;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.approval-hidden {
+  font-style: italic;
+  color: var(--text-faint);
+}
+
+.approval-details {
+  margin-top: 12px;
+  font-size: 12.5px;
+}
+
+.approval-details summary {
+  cursor: pointer;
+  color: var(--text-dim);
+}
+
+.approval-params {
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.approval-param {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 8px;
+}
+
+.approval-param dt {
+  color: var(--text-faint);
+}
+
+.approval-param dd {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .approval-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 10px;
-  justify-content: flex-end;
+  margin-top: 18px;
 }
 
-/* Neither button is the visual default: an approval that can be dismissed by
-   muscle memory has not really been given. */
+/* Neither button is the default: same weight, same shape. */
 .btn {
-  padding: 8px 20px;
-  border-radius: 8px;
-  border: 1px solid var(--hairline);
-  background: var(--raise);
-  color: var(--text);
-  font: inherit;
-  font-size: 13px;
-  cursor: pointer;
+  padding: 10px 14px;
+  border-radius: var(--radius-m);
+  border: 1px solid var(--glass-edge);
+  background: var(--elev-2);
+  font-weight: 600;
   transition: background 160ms var(--ease), border-color 160ms var(--ease);
 }
 
-.btn:disabled {
-  opacity: 0.45;
-  cursor: default;
+.btn:hover:not(:disabled) {
+  background: var(--glass-strong);
 }
 
 .btn-allow:hover:not(:disabled) {
-  border-color: color-mix(in srgb, var(--ok) 52%, transparent);
-  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 60%, var(--line));
 }
 
 .btn-deny:hover:not(:disabled) {
-  border-color: color-mix(in srgb, var(--bad) 52%, transparent);
-  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  border-color: color-mix(in srgb, var(--bad) 60%, var(--line));
+}
+
+.btn:disabled {
+  opacity: 0.55;
 }
 
 .approval-expiry {
-  margin: 14px 0 0;
-  text-align: right;
-  font-size: 11px;
+  margin: 10px 0 0;
+  text-align: center;
+  font-size: 11.5px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
 
-/* ------------------------------------------------------------------ fatal */
-
-.fatal {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 40px;
-  text-align: center;
-}
-
-.fatal h1 {
-  margin: 0;
-  font-size: 17px;
-  font-weight: 400;
-  color: var(--bad);
-}
-
-.fatal p {
-  margin: 0;
-  font-size: 13px;
-  color: var(--text-dim);
-  max-width: 460px;
-  user-select: text;
-}
-
-@keyframes scrim-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-@keyframes approval-in {
-  from { opacity: 0; transform: translateY(10px) scale(0.985); }
-  to { opacity: 1; transform: none; }
-}
-
-/* Respect the OS setting. The orb's own loop checks this too. */
-@media (prefers-reduced-motion: reduce) {
-  * {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-
-/* ------------------------------------------------------- transcript + composer */
-
-/* The orb keeps its place at the top of the stage; the conversation takes the
-   space below it and the composer anchors the bottom. The orb shrinks rather
-   than being removed — it is still the thing that tells you what Axon is
-   doing, and the state colour it carries drives the accent everywhere else. */
-.orb-stage {
-  justify-content: flex-start;
-  gap: 20px;
-  padding: 24px 32px 20px;
-}
-
-.orb-frame {
-  width: min(190px, 24vh);
-  flex: none;
-}
-
-.orb-caption {
-  flex: none;
-}
-
-.transcript {
-  flex: 1 1 auto;
-  width: min(680px, 100%);
-  min-height: 0;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 4px 2px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--hairline) transparent;
-}
-
-.transcript-empty {
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  color: var(--text-faint);
-  font-size: 13px;
-  gap: 6px;
-}
-
-.transcript-hint {
-  color: var(--text-faint);
-  opacity: 0.72;
-}
-
-.turn {
-  display: grid;
-  grid-template-columns: 46px minmax(0, 1fr);
-  gap: 12px;
-  align-items: baseline;
-}
-
-.turn-who {
-  font-size: 10px;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  text-align: right;
-  padding-top: 2px;
-}
-
-.turn-text {
-  color: var(--text-dim);
-  font-size: 13.5px;
-  line-height: 1.62;
-  /* Model output is plain text, but it may still contain newlines the user
-     typed or the model wrote. Preserve them without interpreting markup. */
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.turn-axon .turn-text {
-  color: var(--text);
-}
-
-.turn-axon .turn-who {
-  color: var(--accent);
-}
-
-/* Three dots while a turn is in flight. Deliberately not a progress bar:
-   nothing here knows how long the turn will take, and a bar would imply it. */
-.turn-dots {
-  display: inline-flex;
-  gap: 5px;
-  align-items: center;
-  height: 20px;
-}
-
-.turn-dots i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
-  opacity: 0.35;
-  animation: turn-dot 1.25s var(--ease) infinite;
-}
-
-.turn-dots i:nth-child(2) { animation-delay: 0.16s; }
-.turn-dots i:nth-child(3) { animation-delay: 0.32s; }
-
-@keyframes turn-dot {
-  0%, 70%, 100% { opacity: 0.28; transform: translateY(0); }
-  35% { opacity: 0.95; transform: translateY(-3px); }
-}
-
-.brain-notice {
-  flex: none;
-  width: min(680px, 100%);
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--warn);
-  background: rgba(224, 163, 86, 0.07);
-  border: 1px solid rgba(224, 163, 86, 0.2);
-  border-radius: 10px;
-  padding: 10px 13px;
-}
-
-.composer {
-  flex: none;
-  width: min(680px, 100%);
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 10px 10px 10px 15px;
-  background: var(--raise);
-  border: 1px solid var(--hairline);
-  border-radius: 14px;
-  transition: border-color 220ms var(--ease), background 220ms var(--ease);
-}
-
-.composer:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  background: var(--raise-strong);
-}
-
-.composer-blocked {
-  opacity: 0.72;
-}
-
-.composer-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  resize: none;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  font-size: 13.5px;
-  line-height: 1.55;
-  padding: 5px 0;
-  max-height: 160px;
-}
-
-.composer-input::placeholder {
-  color: var(--text-faint);
-}
-
-.composer-input:disabled {
-  cursor: not-allowed;
-}
-
-.composer-send {
-  flex: none;
-  width: 30px;
-  height: 30px;
-  display: grid;
-  place-items: center;
-  border-radius: 9px;
-  border: 1px solid var(--hairline);
-  background: var(--raise-strong);
-  color: var(--text-dim);
-  font-size: 14px;
-  cursor: pointer;
-  transition: all 180ms var(--ease);
-}
-
-.composer-send:enabled:hover {
-  color: var(--void);
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-.composer-send:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-.composer-spinner {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  border: 1.5px solid var(--hairline);
-  border-top-color: var(--accent);
-  animation: composer-spin 700ms linear infinite;
-}
-
-@keyframes composer-spin {
-  to { transform: rotate(360deg); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .turn-dots i,
-  .composer-spinner {
-    animation: none;
-  }
-}
-
-/* ------------------------------------------------------------ speaking state */
-
-/* Speech is communicated three ways: the orb's motion, this badge, and the
-   state name above it. Animation is never the only signal — with motion
-   reduced or disabled the badge still says what is happening. */
-.speaking-row {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  margin-top: 10px;
-}
-
-.speaking-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  border-radius: 999px;
-  padding: 5px 12px;
-}
-
-.speaking-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: speaking-pulse 1.6s var(--ease) infinite;
-}
-
-@keyframes speaking-pulse {
-  0%, 100% { opacity: 0.4; transform: scale(0.85); }
-  50% { opacity: 1; transform: scale(1.15); }
-}
-
-.speaking-stop {
-  font: inherit;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-dim);
-  background: var(--raise-strong);
-  border: 1px solid var(--hairline);
-  border-radius: 999px;
-  padding: 5px 13px;
-  cursor: pointer;
-  transition: color 180ms var(--ease), border-color 180ms var(--ease);
-}
-
-.speaking-stop:hover {
-  color: var(--text);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-}
-
-/* The orb keeps its own reduced-motion handling; this covers the badge. */
-@media (prefers-reduced-motion: reduce) {
-  .speaking-dot {
-    animation: none;
-    opacity: 1;
-  }
-}
-
-/* ------------------------------------------------------------ voice input */
-
-/* Listening reuses the speaking badge's shape deliberately: the two are the
-   same kind of statement about what Axon is doing right now, and a person
-   should not have to learn a second vocabulary for the second direction of
-   audio. The dot breathes rather than pulses, so the two are still
-   distinguishable at a glance. */
-.listening-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  border-radius: 999px;
-  padding: 5px 12px;
-}
-
-.listening-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: listening-breathe 2.2s var(--ease) infinite;
-}
-
-@keyframes listening-breathe {
-  0%, 100% { opacity: 0.55; transform: scale(0.9); }
-  50% { opacity: 1; transform: scale(1.25); }
-}
-
-.talk {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  flex: none;
-}
-
-.talk-button {
-  font: inherit;
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--text);
-  background: var(--raise-strong);
-  border: 1px solid var(--hairline);
-  border-radius: 999px;
-  padding: 9px 18px;
-  cursor: pointer;
-  transition: color 180ms var(--ease), border-color 180ms var(--ease), background 180ms var(--ease);
-}
-
-.talk-button:enabled:hover {
-  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
-  background: color-mix(in srgb, var(--accent) 10%, var(--raise-strong));
-}
-
-.talk-button:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-/* While the microphone is open the control states it, in colour and in its
-   label, and its job changes to closing it. */
-.talk-button-live {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-}
-
-.talk-icon {
-  font-size: 13px;
-  line-height: 1;
-}
-
-.talk-hint {
-  font-size: 11px;
-  color: var(--text-dim);
-}
-
-.talk-hint-blocked {
-  color: var(--text-dim);
-  max-width: 44ch;
-  text-align: center;
-}
-
-.talk-hint kbd {
-  font: inherit;
-  font-size: 10px;
-  letter-spacing: 0.04em;
-  color: var(--text);
-  background: var(--raise-strong);
-  border: 1px solid var(--hairline);
-  border-radius: 5px;
-  padding: 2px 6px;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .listening-dot {
-    animation: none;
-    opacity: 1;
-  }
-}
-
-/* ------------------------------------------------------------- high risk */
-
-/* The two approval levels must not look alike. A dialog that presents "write
-   a file to your Desktop" and "delete this repository" identically teaches
-   people to click through both, and the second is the one that matters. */
-.approval-risk-requires_approval {
-  color: var(--accent);
-}
-
-.approval-risk-high_risk {
-  color: #ff6b6b;
-  background: color-mix(in srgb, #ff6b6b 12%, transparent);
-  border-color: color-mix(in srgb, #ff6b6b 40%, transparent);
-}
-
-.approval-warning {
-  margin: 12px 0 0;
-  padding: 10px 12px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: #ffb4b4;
-  background: color-mix(in srgb, #ff6b6b 10%, transparent);
-  border: 1px solid color-mix(in srgb, #ff6b6b 30%, transparent);
-  border-radius: 8px;
-}
-
-/* ------------------------------------------------------------- browsing */
-
-.browser-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  max-width: 100%;
-  font-size: 11px;
-  color: var(--text-dim);
-  background: var(--raise-strong);
-  border: 1px solid var(--hairline);
-  border-radius: 999px;
-  padding: 5px 12px;
-}
-
-.browser-badge-host {
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.browser-dot {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: 50%;
-  background: var(--accent);
-}
-
-/* ------------------------------------------------------ settings + privacy */
-
-.titlebar-settings {
-  font: inherit;
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  color: var(--text-dim);
-  background: transparent;
-  border: 1px solid var(--hairline);
-  border-radius: 999px;
-  padding: 3px 10px;
-  margin-left: 12px;
-  cursor: pointer;
-  -webkit-app-region: no-drag;
-  transition: color 180ms var(--ease), border-color 180ms var(--ease);
-}
-
-.titlebar-settings:hover {
-  color: var(--text);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-}
-
-/* Saved-locally is stated quietly and permanently. Persistence that is only
-   visible when it fails is persistence a user has no reason to trust. */
-.saving-on { color: var(--text-dim); }
-.saving-off { color: #e0a356; }
+/* ---------------------------------------------------------------- settings */
 
 .settings-scrim {
-  position: fixed;
+  position: absolute;
   inset: 0;
-  z-index: 40;
   display: flex;
   justify-content: flex-end;
-  background: rgb(3 5 8 / 62%);
-  backdrop-filter: blur(3px);
+  background: var(--scrim);
+  backdrop-filter: blur(8px);
+  z-index: 30;
   animation: fade-in 160ms var(--ease);
 }
 
 .settings {
+  width: min(440px, 100%);
+  height: 100%;
   display: flex;
   flex-direction: column;
-  width: min(520px, 100%);
-  background: var(--surface);
-  border-left: 1px solid var(--hairline);
-  box-shadow: -30px 0 60px rgb(0 0 0 / 45%);
-  animation: settings-in 220ms var(--ease);
-}
-
-@keyframes settings-in {
-  from { transform: translateX(24px); opacity: 0; }
-  to { transform: none; opacity: 1; }
+  background: var(--glass-strong);
+  border-left: 1px solid var(--glass-edge);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(30px) saturate(170%);
+  animation: slide-in 220ms var(--ease);
 }
 
 .settings-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 22px 24px 14px;
+  padding: 14px 16px 6px 20px;
 }
 
 .settings-head h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 600;
-  letter-spacing: 0.01em;
 }
-
-.settings-close {
-  font: inherit;
-  color: var(--text-dim);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  padding: 4px 8px;
-}
-
-.settings-close:hover { color: var(--text); }
 
 .settings-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
-  padding: 0 24px;
-  border-bottom: 1px solid var(--hairline);
+  padding: 6px 14px 10px;
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .settings-tab {
-  font: inherit;
-  font-size: 12px;
-  color: var(--text-dim);
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  padding: 8px 10px 10px;
-  cursor: pointer;
-}
-
-.settings-tab-active {
-  color: var(--text);
-  border-bottom-color: var(--accent);
-}
-
-.settings-body {
-  flex: 1 1 auto;
-  overflow-y: auto;
-  padding: 18px 24px 28px;
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-.settings-section {
-  margin: 6px 0 -6px;
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-dim);
-}
-
-.settings-field { display: flex; flex-direction: column; gap: 6px; }
-.settings-label { font-size: 13px; color: var(--text); }
-.settings-hint { font-size: 11.5px; line-height: 1.5; color: var(--text-dim); }
-.settings-note { margin: 0; font-size: 12px; line-height: 1.6; color: var(--text-dim); }
-.settings-path { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11px; word-break: break-all; }
-
-.settings-row { display: flex; align-items: center; gap: 8px; }
-.settings-row-spread { justify-content: space-between; }
-
-.settings-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  font: inherit;
-  font-size: 12px;
-  color: var(--text);
-  background: var(--raise);
-  border: 1px solid var(--hairline);
-  border-radius: 8px;
-  padding: 7px 10px;
-}
-
-.settings-input:focus { outline: none; border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
-
-.settings-apply,
-.settings-reset,
-.settings-danger,
-.settings-item-delete {
-  font: inherit;
-  font-size: 11px;
-  letter-spacing: 0.03em;
-  color: var(--text-dim);
-  background: var(--raise-strong);
-  border: 1px solid var(--hairline);
+  flex: none;
+  padding: 5px 11px;
+  border: 0;
   border-radius: 999px;
-  padding: 6px 12px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: color 180ms var(--ease), border-color 180ms var(--ease);
-}
-
-.settings-apply:hover,
-.settings-reset:hover { color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
-
-.settings-danger { color: #ff9b9b; border-color: color-mix(in srgb, #ff6b6b 30%, transparent); align-self: flex-start; }
-.settings-danger:hover { color: #ffc4c4; border-color: color-mix(in srgb, #ff6b6b 55%, transparent); }
-.settings-reset { align-self: flex-start; margin-top: 4px; }
-
-.settings-toggle input { accent-color: var(--accent); width: 16px; height: 16px; }
-
-.settings-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.settings-empty { font-size: 12px; color: var(--text-dim); padding: 8px 0; }
-
-.settings-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 9px 11px;
-  background: var(--raise);
-  border: 1px solid var(--hairline);
-  border-radius: 10px;
-}
-
-.settings-item-current { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
-
-.settings-item-main {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font: inherit;
-  text-align: left;
-  color: inherit;
   background: transparent;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-}
-
-.settings-item-static { cursor: default; }
-.settings-item-title { font-size: 12.5px; color: var(--text); display: flex; align-items: center; gap: 8px; }
-.settings-item-value { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
-.settings-item-meta { font-size: 10.5px; color: var(--text-dim); opacity: 0.75; }
-.settings-item-actions { display: flex; gap: 6px; flex: none; }
-
-.settings-chip {
-  font-size: 9.5px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: #e0a356;
-  border: 1px solid color-mix(in srgb, #e0a356 35%, transparent);
-  border-radius: 999px;
-  padding: 1px 6px;
-}
-
-.settings-error {
-  margin: 12px 24px -6px;
-  padding: 9px 12px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: #ffb4b4;
-  background: color-mix(in srgb, #ff6b6b 10%, transparent);
-  border: 1px solid color-mix(in srgb, #ff6b6b 30%, transparent);
-  border-radius: 8px;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .settings { animation: none; }
-}
-
-/* --- Voice session control ------------------------------------------------
-   The privacy indicator. Three states, distinguished in colour AND in the
-   words beside them, because the difference between "listening locally" and
-   "streaming to a service" is the most important thing this window says. */
-.voice-control {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 0 12px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--border, rgb(255 255 255 / 8%));
-  background: var(--surface-sunken, rgb(0 0 0 / 18%));
+  color: var(--text-dim);
   font-size: 12.5px;
 }
 
-.voice-text {
-  flex: 1;
-  color: var(--text-dim);
-  overflow-wrap: anywhere;
+.settings-tab:hover {
+  background: var(--elev);
 }
 
-.voice-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--text-faint);
-}
-
-/* Local-only: the microphone is open and nothing is leaving. */
-.voice-dot-armed {
-  background: #6fcf97;
-  box-shadow: 0 0 0 3px color-mix(in srgb, #6fcf97 22%, transparent);
-}
-
-/* Streaming: audio is leaving the machine. Deliberately the most prominent
-   state in the window, and it pulses so it is noticeable in peripheral
-   vision — an indicator nobody sees is not an indicator. */
-.voice-control-live {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-
-.voice-control-live .voice-text {
+.settings-tab-active {
+  background: rgb(var(--state-rgb) / 0.2);
   color: var(--text);
 }
 
-.voice-dot-live {
-  background: var(--accent);
-  animation: voice-pulse 1.6s ease-in-out infinite;
+.settings-error {
+  margin: 10px 20px 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  font-size: 12.5px;
 }
 
-.voice-dot-connecting {
-  background: #f2c94c;
+.settings-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-@keyframes voice-pulse {
+.settings-section {
+  margin: 10px 0 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.settings-lead {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.settings-note {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  user-select: text;
+}
+
+.settings-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-label {
+  font-size: 13.5px;
+}
+
+.settings-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.settings-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.settings-row-spread {
+  justify-content: space-between;
+}
+
+.settings-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--line);
+  background: var(--elev);
+  outline: none;
+  user-select: text;
+}
+
+.settings-input:focus-visible {
+  border-color: var(--focus);
+}
+
+.settings-apply,
+.settings-item-delete,
+.settings-reset {
+  padding: 6px 12px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--line);
+  background: var(--elev);
+  font-size: 12.5px;
+}
+
+.settings-apply:hover,
+.settings-item-delete:hover,
+.settings-reset:hover {
+  background: var(--elev-2);
+}
+
+.settings-reset {
+  align-self: flex-start;
+  margin-top: 8px;
+  color: var(--text-dim);
+}
+
+.settings-danger {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border-radius: var(--radius-s);
+  border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--line));
+  background: transparent;
+  color: var(--bad);
+  font-size: 12.5px;
+}
+
+.settings-list {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-empty {
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+
+.settings-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-m);
+  background: var(--elev);
+  border: 1px solid var(--line-soft);
+}
+
+.settings-item-current {
+  border-color: rgb(var(--state-rgb) / 0.5);
+}
+
+.settings-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.settings-item-static {
+  cursor: default;
+}
+
+.settings-item-title {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.settings-item-value {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.settings-item-meta {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.settings-item-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.settings-chip {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--elev-2);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.switch {
+  appearance: none;
+  position: relative;
+  width: 38px;
+  height: 22px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--elev-2);
+  border: 1px solid var(--line);
+  transition: background 180ms var(--ease);
+}
+
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform 200ms var(--spring), background 180ms var(--ease);
+}
+
+.switch:checked {
+  background: color-mix(in srgb, var(--ok) 55%, var(--elev-2));
+}
+
+.switch:checked::after {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+.theme-choice {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.theme-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--radius-l);
+  border: 1px solid var(--line);
+  background: var(--elev);
+  font-size: 13px;
+}
+
+.theme-option-active {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 1px var(--focus);
+}
+
+.theme-swatch {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 64px;
+  border-radius: var(--radius-m);
+}
+
+.theme-option-dark .theme-swatch {
+  background: #0d1017;
+}
+
+.theme-option-light .theme-swatch {
+  background: #f3f5fb;
+}
+
+.theme-swatch-orb {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #f3f6fc, #4a96ff 55%, #2a4c9a);
+  box-shadow: 0 0 18px rgba(74, 150, 255, 0.4);
+}
+
+.wake-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-m);
+  background: var(--elev);
+  border: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+
+.wake-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.wake-status-on .wake-status-dot {
+  background: var(--ok);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--ok) 70%, transparent);
+}
+
+/* ------------------------------------------------------------------- fatal */
+
+.fatal {
+  display: grid;
+  place-content: center;
+  height: 100%;
+  padding: 32px;
+  text-align: center;
+}
+
+.fatal h1 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.fatal p {
+  margin: 0;
+  color: var(--text-dim);
+}
+
+/* ================================================================ overlay */
+
+:root[data-surface='overlay'],
+:root[data-surface='overlay'] body,
+:root[data-surface='overlay'] #root {
+  background: transparent;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.overlay [data-interactive] {
+  pointer-events: auto;
+}
+
+/* Soft light along the edges, in the orb's colour. Never interactive. */
+.aura {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: clamp(70px, 11vw, 220px);
+  opacity: 0;
+  transition: opacity 520ms var(--ease);
+}
+
+.aura-left {
+  left: 0;
+  background:
+    radial-gradient(110% 55% at 0% 70%, rgb(var(--state-rgb) / 0.34), transparent 72%),
+    linear-gradient(90deg, rgb(var(--state-rgb) / 0.16), transparent 88%);
+}
+
+.aura-right {
+  right: 0;
+  background:
+    radial-gradient(110% 55% at 100% 70%, rgb(var(--state-rgb) / 0.34), transparent 72%),
+    linear-gradient(270deg, rgb(var(--state-rgb) / 0.16), transparent 88%);
+}
+
+.phase-enter .aura {
+  opacity: 1;
+  animation: aura-breathe 5.5s ease-in-out infinite;
+}
+
+.phase-leave .aura {
+  opacity: 0;
+  transition-duration: 340ms;
+}
+
+.dock {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  width: min(440px, 92vw);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+}
+
+.dock > * {
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+  transition:
+    opacity 260ms var(--ease),
+    transform 320ms var(--spring);
+}
+
+.phase-enter .dock > * {
+  opacity: 1;
+  transform: none;
+}
+
+.phase-leave .dock > * {
+  opacity: 0;
+  transform: translateY(8px) scale(0.97);
+  transition-duration: 300ms;
+}
+
+/* The orb materialises: small, soft and dim, then itself. */
+.dock-orb {
+  position: relative;
+  flex: none;
+  width: 78px;
+  height: 78px;
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  opacity: 0;
+  filter: blur(8px);
+  transform: scale(0.5);
+  transition:
+    transform 340ms var(--spring),
+    opacity 220ms var(--ease),
+    filter 300ms var(--ease);
+}
+
+.phase-enter .dock-orb {
+  opacity: 1;
+  filter: none;
+  transform: scale(1);
+}
+
+.phase-leave .dock-orb {
+  opacity: 0;
+  filter: blur(6px);
+  transform: scale(0.7);
+  transition-duration: 300ms;
+}
+
+.dock-orb:focus-visible {
+  outline-offset: 6px;
+  border-radius: 50%;
+}
+
+.dock-orb .orb-canvas {
+  inset: -60%;
+  width: 220%;
+  height: 220%;
+}
+
+.glass-overlay,
+.dock-caption,
+.dock-exchange {
+  background: linear-gradient(180deg, var(--overlay-glass-top), var(--overlay-glass));
+  border: 1px solid var(--glass-edge);
+  box-shadow:
+    inset 0 1px 0 var(--glass-shine),
+    0 14px 34px rgba(0, 0, 0, 0.26),
+    0 0 0 1px rgb(var(--state-rgb) / 0.08);
+  backdrop-filter: blur(24px) saturate(170%);
+}
+
+.dock-caption {
+  margin: 0;
+  padding: 6px 16px;
+  border-radius: 999px;
+  font-size: 13.5px;
+  font-weight: 560;
+  color: var(--text);
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock-caption-empty {
+  display: none;
+}
+
+.tone-attention .dock-caption {
+  color: var(--warn);
+}
+
+.tone-problem .dock-caption {
+  color: var(--bad);
+}
+
+.dock-notice {
+  white-space: normal;
+  font-weight: 500;
+  font-size: 12.5px;
+}
+
+.dock-exchange {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: var(--radius-l);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.dock-line {
+  margin: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 13.5px;
+  line-height: 1.45;
+}
+
+.dock-user {
+  color: var(--text-dim);
+}
+
+.dock-who {
+  margin-right: 8px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.dock-axon .dock-who {
+  color: rgb(var(--state-ink));
+}
+
+.dock-approval {
+  width: 100%;
+}
+
+.approval-docked {
+  width: 100%;
+  max-height: 60vh;
+  background: linear-gradient(180deg, var(--overlay-glass-top), var(--overlay-glass));
+}
+
+/* -------------------------------------------------------------- animation */
+
+@keyframes pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+    opacity: 1;
   }
   50% {
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent);
+    opacity: 0.45;
   }
 }
 
-/* Respect a user who has asked for less motion. The colour and the sentence
-   still carry the state; only the animation goes. */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+}
+
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+}
+
+@keyframes ambient-drift {
+  from {
+    transform: translate3d(-3%, -2%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(3%, 2%, 0) scale(1.08);
+  }
+}
+
+@keyframes aura-breathe {
+  0%,
+  100% {
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .voice-dot-live {
-    animation: none;
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
   }
 }
 
-.voice-control-unavailable .voice-text {
-  color: var(--text-faint);
+@media (max-height: 640px) {
+  .orb-button {
+    width: min(62vw, 34vh, 250px);
+    margin-top: 0;
+  }
+
+  .presence-headline {
+    font-size: 19px;
+  }
 }

@@ -35,13 +35,24 @@ export const INITIAL_STATE: AxonState = 'IDLE';
  * - WAITING_FOR_APPROVAL is reachable only from EXECUTING and THINKING,
  *   because an approval is always raised by a pending tool call.
  * - LISTENING cannot jump straight to EXECUTING: audio must be understood
- *   (THINKING) before anything can act.
+ *   (THINKING) before anything can act. That is the direction that matters,
+ *   and it stays forbidden.
+ * - THINKING and EXECUTING CAN return to LISTENING, and must. In a live voice
+ *   session the microphone reopens the moment the model's turn ends, and a
+ *   user can start talking over a tool that is still running. Without these
+ *   two edges the machine refused the move and left the state alone — so the
+ *   orb sat on "working" with the microphone open, which is the single thing
+ *   this state machine exists to prevent. It was visible in the live smoke
+ *   run as `no legal route from EXECUTING to LISTENING`, four times.
+ * - WAITING_FOR_APPROVAL deliberately has NO edge to LISTENING. A pending
+ *   approval is the more important thing on screen, and it stays on screen
+ *   until somebody answers it.
  */
 export const LEGAL_TRANSITIONS: Readonly<Record<AxonState, readonly AxonState[]>> = Object.freeze({
   IDLE: ['LISTENING', 'THINKING', 'ERROR'],
   LISTENING: ['THINKING', 'IDLE', 'ERROR'],
-  THINKING: ['EXECUTING', 'SPEAKING', 'WAITING_FOR_APPROVAL', 'IDLE', 'ERROR'],
-  EXECUTING: ['THINKING', 'WAITING_FOR_APPROVAL', 'SPEAKING', 'IDLE', 'ERROR'],
+  THINKING: ['EXECUTING', 'SPEAKING', 'WAITING_FOR_APPROVAL', 'LISTENING', 'IDLE', 'ERROR'],
+  EXECUTING: ['THINKING', 'WAITING_FOR_APPROVAL', 'SPEAKING', 'LISTENING', 'IDLE', 'ERROR'],
   WAITING_FOR_APPROVAL: ['EXECUTING', 'THINKING', 'IDLE', 'ERROR'],
   SPEAKING: ['IDLE', 'LISTENING', 'THINKING', 'ERROR'],
   ERROR: ['IDLE'],

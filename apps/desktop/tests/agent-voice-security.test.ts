@@ -22,11 +22,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { DEFERRED_TOOL_RESULT, VOICE_AGENT_LIMITS, type ToolResult, type ToolSchema } from '@axon/core';
+import {
+  DEFERRED_TOOL_RESULT,
+  IN_PROGRESS_TOOL_RESULT,
+  TASK_LIMITS,
+  VOICE_AGENT_LIMITS,
+  type ToolResult,
+  type ToolSchema,
+} from '@axon/core';
 import { buildAgentSystemPrompt, buildAgentTools } from '../src/main/agent/agent-tool-surface.js';
 import { ToolBridge, toAgentResult } from '../src/main/agent/tool-bridge.js';
+import { TaskLedger } from '../src/main/agent/task-ledger.js';
 import { describeSocketError } from '../src/main/agent/assemblyai-client.js';
 import { matchesWakePhrase, normalizePhrase, WAKE_PHRASES } from '../src/main/wake/wake-word.js';
+
+/**
+ * A ledger with a task already open.
+ *
+ * Phase 3 made an active task a PRECONDITION for a tool call rather than
+ * bookkeeping around one: `beginStep` returns null when there is nothing to
+ * open a step against, and the bridge refuses the call. Every fixture that
+ * wants a call to proceed therefore has to have asked for something first,
+ * which is exactly the invariant being asserted.
+ */
+function liveTasks(): TaskLedger {
+  const ledger = new TaskLedger();
+  ledger.begin('do the thing', 'voice');
+  return ledger;
+}
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DESKTOP_SRC = path.resolve(HERE, '../src');
@@ -231,6 +254,7 @@ describe('a tool call from the provider cannot bypass the dispatcher', () => {
   }) {
     const dispatched: { tool: string; input: unknown }[] = [];
     const outcomes: string[] = [];
+    const lateResults: { callId: string; result: string }[] = [];
 
     const instance = new ToolBridge({
       tools: options.tools ?? [schema('browser.read')],
@@ -238,6 +262,8 @@ describe('a tool call from the provider cannot bypass the dispatcher', () => {
       willRequireApproval: () => options.requiresApproval ?? false,
       onDeferredOutcome: (summary) => outcomes.push(summary),
       onNotice: () => {},
+      onLateResult: (late) => lateResults.push(late),
+      tasks: liveTasks(),
       dispatch: async (call) => {
         dispatched.push({ tool: call.tool, input: call.input });
         if (options.dispatch) return options.dispatch(call);
@@ -281,6 +307,13 @@ describe('a tool call from the provider cannot bypass the dispatcher', () => {
   });
 
   it('bounds how many actions one conversation may take', async () => {
+    // TWO bounds now, and both matter. `maxStepsPerTask` bounds one request —
+    // a task that has taken forty actions has stopped converging — and
+    // `maxToolCallsPerSession` bounds the whole conversation across however
+    // many requests it contains. The tighter one bites first, which is the
+    // point of having it.
+    expect(TASK_LIMITS.maxStepsPerTask).toBeLessThan(VOICE_AGENT_LIMITS.maxToolCallsPerSession);
+
     const rig = bridge({});
     for (let i = 0; i <= VOICE_AGENT_LIMITS.maxToolCallsPerSession; i += 1) {
       await rig.instance.handleToolCall(`c${i}`, 'browser.read', { i });
@@ -288,8 +321,23 @@ describe('a tool call from the provider cannot bypass the dispatcher', () => {
 
     const flushed = rig.instance.flush('completed');
     const last = JSON.parse(flushed.at(-1)!.result) as { errorKind?: string };
-    expect(last.errorKind).toBe('BUDGET_EXCEEDED');
-    expect(rig.dispatched.length).toBe(VOICE_AGENT_LIMITS.maxToolCallsPerSession);
+    // Whichever bound bit, the call is refused rather than run.
+    expect(['BUDGET_EXCEEDED', 'CANCELLED']).toContain(last.errorKind);
+    // And nothing beyond the per-task ceiling was ever dispatched.
+    expect(rig.dispatched.length).toBeLessThanOrEqual(TASK_LIMITS.maxStepsPerTask);
+    expect(rig.dispatched.length).toBeGreaterThan(0);
+  });
+
+  it('stops a request that has taken too many steps, without ending the session', async () => {
+    const rig = bridge({});
+    for (let i = 0; i <= TASK_LIMITS.maxStepsPerTask; i += 1) {
+      await rig.instance.handleToolCall(`c${i}`, 'browser.read', { i });
+    }
+
+    expect(rig.dispatched.length).toBe(TASK_LIMITS.maxStepsPerTask);
+    const last = JSON.parse(rig.instance.flush('completed').at(-1)!.result) as { error?: string };
+    // And the refusal tells the agent to stop rather than to try differently.
+    expect(last.error).toMatch(/no longer active|do not carry on/i);
   });
 });
 
@@ -309,6 +357,7 @@ describe('an approval-gated action is deferred rather than held', () => {
     let resolveDispatch: ((result: ToolResult) => void) | null = null;
     const dispatched: string[] = [];
     const outcomes: string[] = [];
+    const lateResults: { callId: string; result: string }[] = [];
 
     const instance = new ToolBridge({
       tools: [schema],
@@ -316,6 +365,8 @@ describe('an approval-gated action is deferred rather than held', () => {
       willRequireApproval: () => true,
       onDeferredOutcome: (summary) => outcomes.push(summary),
       onNotice: () => {},
+      onLateResult: (late) => lateResults.push(late),
+      tasks: liveTasks(),
       dispatch: (call) => {
         dispatched.push(call.tool);
         // Never resolves during this test: it stands in for a human who has
@@ -348,12 +399,15 @@ describe('an approval-gated action is deferred rather than held', () => {
 
   it('speaks the outcome only after the action has really run', async () => {
     const outcomes: string[] = [];
+    const lateResults: { callId: string; result: string }[] = [];
     const instance = new ToolBridge({
       tools: [schema],
       newCallId: () => 'call-1',
       willRequireApproval: () => true,
       onDeferredOutcome: (summary) => outcomes.push(summary),
       onNotice: () => {},
+      onLateResult: (late) => lateResults.push(late),
+      tasks: liveTasks(),
       dispatch: (call) =>
         Promise.resolve({
           callId: call.callId,
@@ -373,12 +427,15 @@ describe('an approval-gated action is deferred rather than held', () => {
 
   it('says plainly when the user denied it, and not to ask again', async () => {
     const outcomes: string[] = [];
+    const lateResults: { callId: string; result: string }[] = [];
     const instance = new ToolBridge({
       tools: [schema],
       newCallId: () => 'call-1',
       willRequireApproval: () => true,
       onDeferredOutcome: (summary) => outcomes.push(summary),
       onNotice: () => {},
+      onLateResult: (late) => lateResults.push(late),
+      tasks: liveTasks(),
       dispatch: (call) =>
         Promise.resolve({
           callId: call.callId,
@@ -408,6 +465,8 @@ describe('an approval-gated action is deferred rather than held', () => {
         willRequireApproval: () => true,
         onDeferredOutcome: (summary) => outcomes.push(summary),
         onNotice: () => {},
+        onLateResult: () => {},
+        tasks: liveTasks(),
         dispatch: (call) =>
           Promise.resolve({
             callId: call.callId,
@@ -433,6 +492,8 @@ describe('an approval-gated action is deferred rather than held', () => {
       willRequireApproval: () => false,
       onDeferredOutcome: () => {},
       onNotice: () => {},
+      onLateResult: () => {},
+      tasks: liveTasks(),
       dispatch: (call) =>
         Promise.resolve({ callId: call.callId, tool: call.tool, ok: true, output: null, durationMs: 1 }),
     });
@@ -489,7 +550,6 @@ describe('the provider is never given a server-side tool', () => {
     const prompt = buildAgentSystemPrompt({
       tools,
       platform: 'win32',
-      now: '2026-09-07T10:00:00.000Z',
       workspaceRoot: 'C:/Axon/workspace',
     });
 
@@ -655,3 +715,355 @@ describe('tool results returned to the provider', () => {
     expect(body.retryable).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The Phase 2 tools are proposals like every other.
+// ---------------------------------------------------------------------------
+
+/**
+ * A voice agent gains no authority by the tools getting more powerful.
+ *
+ * Phase 2 gave Axon a clock, a look at the screen, and the ability to activate
+ * a control and put text into a field. Each of those arrives at the provider
+ * as a NAME and a JSON Schema, and comes back as a `tool.call` — a proposal
+ * that goes through the same dispatcher, the same risk policy, the same
+ * approval gate. These tests assert that the new surface did not quietly grow
+ * a second path.
+ */
+describe('the new tools reach the world the same way as the old ones', () => {
+  const phaseTwoTools: readonly ToolSchema[] = [
+    { name: 'system.time', title: 'Check the time', description: 'Reads the computer clock.', inputSchema: { type: 'object' } },
+    { name: 'system.screenshot', title: 'Look at the screen', description: 'Captures and reads the screen.', inputSchema: { type: 'object' } },
+    { name: 'ui.click', title: 'Activate something on screen', description: 'Activates a control by reference.', inputSchema: { type: 'object' } },
+    { name: 'keyboard.type', title: 'Type into a field on screen', description: 'Puts text into a field by reference.', inputSchema: { type: 'object' } },
+  ];
+
+  it('sends no server-side tool, so none of them can run without Axon', () => {
+    // The load-bearing one. A tool with an `http` block is called by the
+    // provider's own servers: Axon would not see it, could not gate it, and
+    // could not refuse it. Restated for the tools that can now act on the
+    // user's desktop.
+    const definitions = buildAgentTools(phaseTwoTools);
+    expect(JSON.stringify(definitions)).not.toContain('http');
+    for (const definition of definitions) {
+      expect(definition.type).toBe('function');
+      expect(definition.execution_mode).toBe('interactive');
+    }
+  });
+
+  it('carries no executor, no path and no handle into the provider payload', () => {
+    const serialized = JSON.stringify(buildAgentTools(phaseTwoTools));
+    expect(serialized).not.toContain('function(');
+    expect(serialized).not.toMatch(/C:\\|\/home\/|windowHandle|automationId/);
+  });
+
+  it('dispatches every one of them, and never runs one itself', async () => {
+    const dispatched: string[] = [];
+    const instance = new ToolBridge({
+      dispatch: (call) => {
+        dispatched.push(call.tool);
+        return Promise.resolve({ callId: call.callId, tool: call.tool, ok: true, output: {}, durationMs: 1 });
+      },
+      tools: phaseTwoTools,
+      newCallId: () => 'call-1',
+      willRequireApproval: () => false,
+      onDeferredOutcome: () => {},
+      onNotice: () => {},
+      onLateResult: () => {},
+      tasks: liveTasks(),
+    });
+
+    // DISTINCT call ids, as a real provider sends. Reusing one is a retry, and
+    // a retry is answered from the record rather than run again — see the
+    // duplicate test below, which is the same fact from the other side.
+    let n = 0;
+    for (const tool of phaseTwoTools) {
+      n += 1;
+      await instance.handleToolCall(`p${n}`, tool.name, {});
+    }
+    expect(dispatched.sort()).toEqual(['keyboard.type', 'system.screenshot', 'system.time', 'ui.click']);
+  });
+
+  it('answers an approval-gated screen action as pending, and does not run it on the wire', async () => {
+    // The deferred-result pattern, restated for a tool that can make another
+    // application do something. The agent is told the truth — this has not
+    // run — and the approval proceeds on Axon's clock.
+    let dispatchedAt: number | null = null;
+    const instance = new ToolBridge({
+      dispatch: () => {
+        dispatchedAt = Date.now();
+        return new Promise(() => {}) as Promise<ToolResult>;
+      },
+      tools: phaseTwoTools,
+      newCallId: () => 'call-1',
+      willRequireApproval: (tool) => tool === 'ui.click',
+      onDeferredOutcome: () => {},
+      onNotice: () => {},
+      onLateResult: () => {},
+      tasks: liveTasks(),
+    });
+
+    await instance.handleToolCall('p1', 'ui.click', { ref: 't1', action: 'invoke' });
+
+    const queued = instance.flush('completed');
+    expect(queued).toHaveLength(1);
+    const body = JSON.parse(queued[0]!.result) as { status: string; executed: boolean };
+    expect(body.status).toBe(DEFERRED_TOOL_RESULT.status);
+    expect(body.executed).toBe(false);
+    // It IS dispatched — on Axon's own clock, behind the approval — and the
+    // answer on the wire did not wait for a person.
+    expect(dispatchedAt).not.toBeNull();
+  });
+
+  it('refuses a tool name the provider invented, including a plausible one', async () => {
+    const dispatched: string[] = [];
+    const instance = new ToolBridge({
+      dispatch: (call) => {
+        dispatched.push(call.tool);
+        return Promise.resolve({ callId: call.callId, tool: call.tool, ok: true, output: {}, durationMs: 1 });
+      },
+      tools: phaseTwoTools,
+      newCallId: () => 'call-1',
+      willRequireApproval: () => false,
+      onDeferredOutcome: () => {},
+      onNotice: () => {},
+      onLateResult: () => {},
+      tasks: liveTasks(),
+    });
+
+    // `mouse.click` and `keyboard.press` do not exist, and a model that has
+    // read about desktop agents will try them.
+    for (const invented of ['mouse.click', 'keyboard.press', 'shell.run', 'system.exec']) {
+      await instance.handleToolCall(`p-${invented}`, invented, { x: 940, y: 512 });
+    }
+
+    expect(dispatched).toEqual([]);
+    for (const queued of instance.flush('completed')) {
+      const body = JSON.parse(queued.result) as { ok: boolean; errorKind: string };
+      expect(body.ok).toBe(false);
+      expect(body.errorKind).toBe('UNKNOWN_TOOL');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A result that finishes after the turn closed.
+// ---------------------------------------------------------------------------
+
+/**
+ * The failure these tests are about, in the words the user actually heard.
+ *
+ * `flush` sends whatever has finished when `reply.done` arrives. A tool still
+ * running at that instant had its result dropped, and there was no second
+ * flush to carry it — so the agent composed its answer having never learned
+ * what happened.
+ *
+ * A live test made that concrete and made it ugly. `system.time` (1ms) and
+ * `app.open` (under a second) finished in time and were reported correctly.
+ * `system.screenshot` (3.2s) and `browser.open` (several seconds) did not, so
+ * Axon said "I could not capture a screenshot" about a capture that succeeded,
+ * and "GitHub did not load" about a page that was on the user's screen.
+ *
+ * Axon announcing a failure that did not happen is the same defect as Axon
+ * announcing a success that did not happen. It arrives from the other
+ * direction and it is just as corrosive: a user who is told things failed when
+ * they worked stops believing the ones that really did fail.
+ */
+describe('a slow tool is answered "in progress", never left unanswered', () => {
+  const slowSchema: ToolSchema = {
+    name: 'system.screenshot',
+    title: 'Look at the screen',
+    description: 'Captures and reads the screen.',
+    inputSchema: { type: 'object' },
+  };
+
+  /**
+   * A bridge whose dispatch finishes only when the test says so.
+   *
+   * The inline budget is pinned tiny so "slow" is deterministic rather than a
+   * race against a real clock.
+   */
+  function slowBridge(outcome: 'ok' | 'fail' = 'ok', options: { readonly tasks?: TaskLedger } = {}) {
+    const late: { callId: string; result: string }[] = [];
+    const spoken: string[] = [];
+    const notices: string[] = [];
+    const tasks = options.tasks ?? liveTasks();
+    let release: (() => void) | null = null;
+
+    const instance = new ToolBridge({
+      tools: [slowSchema],
+      newCallId: () => 'call-1',
+      willRequireApproval: () => false,
+      onDeferredOutcome: (summary) => spoken.push(summary),
+      onNotice: (summary) => notices.push(summary),
+      onLateResult: (entry) => late.push(entry),
+      tasks,
+      inlineBudgetMs: 5,
+      dispatch: (call) =>
+        new Promise<ToolResult>((resolve) => {
+          release = (): void =>
+            resolve(
+              outcome === 'ok'
+                ? { callId: call.callId, tool: call.tool, ok: true, output: { captured: true }, durationMs: 3_200 }
+                : {
+                    callId: call.callId,
+                    tool: call.tool,
+                    ok: false,
+                    failure: { kind: 'EXECUTION_ERROR', message: 'the capture failed', detail: null },
+                    durationMs: 3_200,
+                  },
+            );
+        }),
+    });
+
+    return {
+      instance,
+      late,
+      spoken,
+      notices,
+      tasks,
+      finish: async (): Promise<void> => {
+        release?.();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      },
+    };
+  }
+
+  it('answers within the inline budget rather than leaving the agent to guess', async () => {
+    // THE PHASE 3 FIX, stated as the thing that goes wrong without it. An
+    // unanswered tool call leaves the agent composing a reply with nothing in
+    // hand — and in live use it filled that gap by guessing FAILURE, telling
+    // the user "GitHub did not load" about a page on their screen.
+    const h = slowBridge();
+    const call = h.instance.handleToolCall('p1', 'system.screenshot', {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    // The call is answered before the work is anywhere near done.
+    expect(h.instance.pendingCount).toBe(1);
+    const answer = JSON.parse(h.instance.flush('completed')[0]!.result) as {
+      status: string;
+      executed: boolean;
+      message: string;
+      doing?: string;
+    };
+    expect(answer.status).toBe(IN_PROGRESS_TOOL_RESULT.status);
+    // The load-bearing field: an agent that read this as success would
+    // announce something that has not happened.
+    expect(answer.executed).toBe(false);
+    expect(answer.message).toMatch(/do not say it worked and do not say it failed/i);
+
+    // AXON SUPPLIES THE WORDS. "Looking at the screen" is a statement of
+    // INTENT — safe before anything has happened — and handing the phrasing
+    // over rather than leaving the agent to invent one is what stops an
+    // acknowledgement quietly becoming an announcement.
+    expect(answer.doing).toBe('Looking at the screen');
+    expect(answer.message).toContain('Looking at the screen');
+    // And it is still not a claim about the world.
+    expect(answer.doing).not.toMatch(/captured|is open|done|finished/i);
+
+    await h.finish();
+    await call;
+  });
+
+  it('delivers the outcome as the first thing anybody says about it', async () => {
+    const h = slowBridge();
+    const call = h.instance.handleToolCall('p1', 'system.screenshot', {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    h.instance.flush('completed');
+    await h.finish();
+    await call;
+
+    expect(h.spoken).toHaveLength(1);
+    expect(h.spoken[0]).toMatch(/SUCCEEDED/);
+    expect(h.spoken[0]).toMatch(/one short sentence/i);
+    // NOT a correction. With the in-progress answer in place the agent never
+    // claimed an outcome, so there is nothing to retract — and being told to
+    // "correct yourself" would invite it to narrate the retraction.
+    expect(h.spoken[0]).not.toMatch(/correct yourself/i);
+    expect(h.spoken[0]).toMatch(/do not mention timing/i);
+  });
+
+  it('replaces the in-progress answer when the work beats the flush', async () => {
+    // The intermediate state is a fallback, not a ceremony. If the work
+    // finishes while the turn is still open, the user hears ONE sentence.
+    const h = slowBridge();
+    const call = h.instance.handleToolCall('p1', 'system.screenshot', {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await h.finish();
+    await call;
+
+    expect(h.instance.pendingCount).toBe(1);
+    const flushed = JSON.parse(h.instance.flush('completed')[0]!.result) as { ok?: boolean; status?: string };
+    expect(flushed.ok).toBe(true);
+    expect(flushed.status).toBeUndefined();
+    // And nothing was spoken as a separate turn, because nothing needed to be.
+    expect(h.spoken).toEqual([]);
+  });
+
+  it('reports a slow failure plainly, and does not invite a retry', async () => {
+    const h = slowBridge('fail');
+    const call = h.instance.handleToolCall('p1', 'system.screenshot', {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    h.instance.flush('completed');
+    await h.finish();
+    await call;
+
+    expect(h.spoken).toHaveLength(1);
+    expect(h.spoken[0]).toMatch(/did NOT succeed/);
+    expect(h.spoken[0]).toMatch(/do not try again on your own/i);
+  });
+
+  it('says nothing about a result its task no longer wants', async () => {
+    // Rule 4. The user said stop while the capture was running; the result
+    // arrives into a task that has been cancelled, and delivering it would let
+    // abandoned work speak.
+    const h = slowBridge();
+    const call = h.instance.handleToolCall('p1', 'system.screenshot', {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    h.instance.flush('completed');
+
+    h.tasks.cancelActive();
+    await h.finish();
+    await call;
+
+    expect(h.spoken).toEqual([]);
+    expect(h.notices.some((notice) => /after you stopped it/i.test(notice))).toBe(true);
+  });
+
+  it('refuses a new call once the task has been cancelled', async () => {
+    const h = slowBridge();
+    h.tasks.cancelActive();
+
+    await h.instance.handleToolCall('p9', 'system.screenshot', {});
+    const answer = JSON.parse(h.instance.flush('completed')[0]!.result) as { ok: boolean; errorKind: string };
+    expect(answer.ok).toBe(false);
+    expect(answer.errorKind).toBe('CANCELLED');
+  });
+
+  it('still discards everything for a turn the user talked over', async () => {
+    // The interruption rule is unchanged. A user who talked over Axon must not
+    // hear the answer to the thing they interrupted.
+    const h = slowBridge();
+    const call = h.instance.handleToolCall('p1', 'system.screenshot', {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(h.instance.flush('interrupted')).toEqual([]);
+    await h.finish();
+    await call;
+
+    expect(h.late).toEqual([]);
+  });
+
+  it('says nothing at all once the session has closed', async () => {
+    const h = slowBridge();
+    const call = h.instance.handleToolCall('p1', 'system.screenshot', {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    h.instance.flush('completed');
+    h.instance.close();
+    await h.finish();
+    await call;
+
+    expect(h.late).toEqual([]);
+    expect(h.spoken).toEqual([]);
+  });
+});
+

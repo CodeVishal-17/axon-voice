@@ -76,6 +76,46 @@ export interface SpeechReport {
   readonly error: string | null;
 }
 
+/**
+ * Why a chunk of the voice agent's reply audio was not played.
+ *
+ * Each of these used to be a silent `return` in `receiveAudio`, which is why
+ * "Hindi text on screen, no Hindi audio" could not be diagnosed: nothing
+ * distinguished "the provider sent no audio" from "Axon threw it away".
+ */
+export const REPLY_AUDIO_REJECTIONS = ['not-a-string', 'empty', 'not-base64', 'decoded-empty', 'oversized'] as const;
+export type ReplyAudioRejection = (typeof REPLY_AUDIO_REJECTIONS)[number];
+
+/** What the renderer can say about playing one reply. */
+export const PLAYBACK_EVENTS = ['received', 'started', 'ended', 'failed'] as const;
+export type PlaybackEvent = (typeof PLAYBACK_EVENTS)[number];
+
+/**
+ * The renderer's account of one reply's playback. NUMBERS AND FIXED WORDS.
+ *
+ * No audio, no text Axon said, nothing the user said. `speechId` is the
+ * correlation id main minted and sent with every chunk, so a report can be
+ * laid next to main's own count for the same reply: main sent 38 chunks, the
+ * renderer received 38, playback started, playback ended — or where that
+ * chain breaks.
+ */
+export interface PlaybackDiagnostics {
+  readonly speechId: string;
+  readonly event: PlaybackEvent;
+  /** Chunks received for this reply so far. */
+  readonly chunks: number;
+  /** Bytes of PCM received for this reply so far. */
+  readonly bytes: number;
+  /** A short reason for 'failed', else null. */
+  readonly reason: string | null;
+}
+
+/** Bounds applied on both sides of the boundary. */
+export const PLAYBACK_DIAGNOSTICS_LIMITS = {
+  maxSpeechIdCharacters: 64,
+  maxReasonCharacters: 120,
+} as const;
+
 /** Whether Axon can speak, and why not when it cannot. */
 export interface SpeechStatus {
   readonly available: boolean;

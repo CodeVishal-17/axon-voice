@@ -44,6 +44,10 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  EXECUTOR_FAILURE_KINDS,
+  declaredFailureKind,
+  describeProgress,
+  isClarificationRequired,
   toJsonValue,
   unknownRisk,
   type ApprovalRequest,
@@ -53,6 +57,7 @@ import {
   type RiskAssessment,
   type RiskLevel,
   type SideEffectClass,
+  type ExecutorFailureKind,
   type ToolCall,
   type ToolExecutionContext,
   type ToolFailure,
@@ -98,6 +103,31 @@ export interface DispatcherOptions {
    * navigated to — never anything from page storage.
    */
   readonly currentPage?: () => string | null;
+}
+
+/**
+ * What to tell the model when an executor throws.
+ *
+ * Most thrown messages in this codebase are written to be read out: "That
+ * element is no longer on the page." Those pass through untouched, because
+ * they are the best explanation anyone has of what happened.
+ *
+ * A JavaScript fault is different. "Cannot read properties of undefined
+ * (reading 'frame')" is a message written for whoever will fix it, and the
+ * path it takes from here is: model, sentence, room. So an internal fault is
+ * replaced by a sentence that says the true thing at the level the listener
+ * can act on — and the original goes to the event log, where the person who
+ * will fix it is actually looking.
+ */
+export function describeExecutionError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+
+  const internal =
+    /cannot read propert|is not a function|is not defined|undefined is not|null is not|converting circular|maximum call stack|unexpected token|cannot access .* before initialization/i;
+
+  if (internal.test(raw)) return 'Something went wrong inside Axon while doing that.';
+  if (raw.trim() === '') return 'That did not work, and Axon has no more detail than that.';
+  return raw;
 }
 
 export class Dispatcher {
@@ -238,13 +268,62 @@ export class Dispatcher {
     // it outright — so answering `false` here is right: it should be attempted
     // inline and fail fast with a schema error the model can read.
     if (!parsed.success) return false;
+    // Likewise a call its precheck refuses — "no such application", "which
+    // one?" — never reaches an approval either. Answering `false` lets it run
+    // inline and fail at once, instead of the agent announcing a pending
+    // approval for something that is about to be refused.
+    if (!this.precheck(registered, parsed.data).ok) return false;
 
     try {
-      const decision = this.policy.decide(this.assessRisk(registered, parsed.data));
-      return decision.action === 'REQUIRE_APPROVAL';
+      // The goal boundary too, exactly as `dispatch` applies it. Without it
+      // this answered "no" for a navigation the real dispatch would escalate,
+      // and the voice agent was left holding a call open behind a dialog it
+      // had not been told about. It can only escalate, so adding it can only
+      // make this answer MORE cautious.
+      const assessment = withGoalBoundary(this.assessRisk(registered, parsed.data), {
+        tool,
+        input: parsed.data,
+        goal: this.turnGoal,
+      });
+      return this.policy.decide(assessment).action === 'REQUIRE_APPROVAL';
     } catch {
       return true;
     }
+  }
+
+  /**
+   * The one line that describes the act about to be authorised.
+   *
+   * Same read-only posture as `requiresApproval`, and for the same caller: the
+   * voice agent, which now says what is being asked about instead of "I have
+   * asked you to approve something". On a stage — and in a kitchen, where
+   * nobody is looking at the screen — "Axon wants to click Submit application
+   * on careers.example.com. Allow?" is the difference between an approval a
+   * person can answer and a noise they dismiss.
+   *
+   * It is the SAME `summarize` the dialog renders, so the sentence heard and
+   * the sentence shown cannot drift apart. Parameters are deliberately not
+   * included: those carry the content — the text of a comment, a value in a
+   * field — and content belongs on the screen where it can be read, not in a
+   * sentence spoken at somebody.
+   *
+   * The label inside it can come from a PAGE (`click "Submit application"`),
+   * which is untrusted text. It is trimmed to one line and bounded here, and
+   * it reaches the model as the description of a pending approval rather than
+   * as an instruction — the same footing as any other page text.
+   */
+  describeApproval(tool: string, input: JsonValue): string | null {
+    const registered = this.registry.get(tool);
+    if (!registered) return null;
+
+    const parsed = registered.inputSchema.safeParse(input);
+    if (!parsed.success) return null;
+
+    const title = this.summarize(registered, parsed.data).title;
+    if (typeof title !== 'string' || title.trim() === '') return null;
+
+    const oneLine = title.replace(/\s+/g, ' ').trim();
+    return oneLine.length > 120 ? `${oneLine.slice(0, 117)}...` : oneLine;
   }
 
   async dispatch(call: ToolCall): Promise<ToolResult> {
@@ -285,7 +364,13 @@ export class Dispatcher {
     if (!precheck.ok) {
       this.emitCall(call, 'FORBIDDEN', precheck.reason);
       return this.fail(call, startedAt, {
-        kind: precheck.retryable ? 'STALE_REFERENCE' : 'FORBIDDEN',
+        // A precheck may say WHAT is wrong — "no application called that" is
+        // NOT_FOUND, "two applications match" is a question — and only from
+        // the kinds an executor may declare, so it can describe a failure but
+        // never forge an approval outcome. Otherwise, as before.
+        kind: precheck.clarify
+          ? 'CLARIFICATION_NEEDED'
+          : (precheck.kind ?? (precheck.retryable ? 'STALE_REFERENCE' : 'FORBIDDEN')),
         message: precheck.reason,
         detail: null,
       });
@@ -352,7 +437,10 @@ export class Dispatcher {
         // Denial leaves the machine in WAITING_FOR_APPROVAL, and this return
         // sits outside the try/finally below, so settle explicitly. Without
         // this the UI stays stuck on the approval state after a "Deny".
-        this.states.settle(`${tool.name} was not approved`);
+        // Words for the caption under the orb, which the audience reads. A tool
+        // name there ("browser.click was not approved") is the machinery
+        // showing through; the timeline keeps the name for developers.
+        this.states.settle('Not approved');
         return this.fail(call, startedAt, gate.failure);
       }
 
@@ -366,7 +454,7 @@ export class Dispatcher {
       // of silently executing something nobody approved.
       const executingFingerprint = fingerprintCall(call.tool, input);
       if (executingFingerprint !== gate.fingerprint) {
-        this.states.settle(`${tool.name} changed after approval`);
+        this.states.settle('Stopped: it changed after approval');
         return this.fail(call, startedAt, {
           kind: 'APPROVAL_MISMATCH',
           message:
@@ -378,14 +466,23 @@ export class Dispatcher {
     }
 
     // --- Execution --------------------------------------------------------
-    this.states.enterExecuting(`Running ${tool.name}`);
+    this.states.enterExecuting(describeProgress(tool.name, input) ?? 'Working on it');
     // Recorded BEFORE the executor runs, not after. The dangerous case is an
     // action whose request reached the network and whose executor then threw
     // or was cancelled: a ledger written on success would leave that
     // unrecorded and let the next attempt repeat it.
     this.ledger.record(effect, fingerprint, call.tool, 'attempted');
+    // Captured BEFORE the await, and consulted after it.
+    //
+    // The classification below used to read `this.turnSignal`, which is the
+    // signal installed NOW rather than the one this execution was handed. Those
+    // come apart in exactly the case that matters: cancelling clears the turn
+    // signal so the next request is not born aborted, so by the time an
+    // aborted executor's rejection arrived there was nothing left to say it
+    // had been cancelled — and a cancelled action was reported as a crash.
+    const executionSignal = this.signalFor();
     try {
-      const output = await tool.execute(input, this.contextFor(call));
+      const output = await tool.execute(input, this.contextFor(call, executionSignal));
       const durationMs = Date.now() - startedAt;
       this.bus.emit({
         type: 'TOOL_RESULT',
@@ -398,16 +495,40 @@ export class Dispatcher {
       });
       return { callId: call.callId, tool: call.tool, ok: true, output, durationMs };
     } catch (error) {
+      // An executor that refused because the REQUEST was ambiguous is not
+      // reporting a fault. Preserving that distinction all the way out is what
+      // turns "I could not do that" into "which one did you mean?" — see
+      // `ClarificationRequired`. The detail is dropped for this one: the
+      // message is a question meant to be read aloud, and an error's internal
+      // shape adds nothing to it.
+      if (isClarificationRequired(error)) {
+        return this.fail(call, startedAt, {
+          kind: 'CLARIFICATION_NEEDED',
+          message: error.message,
+          detail: null,
+        });
+      }
       return this.fail(call, startedAt, {
         // A cancelled turn and a shutdown are both cancellation from the
         // caller's point of view: neither is a fault in the tool, and neither
         // is worth retrying.
-        kind: this.shutdown.signal.aborted || this.turnSignal?.aborted ? 'CANCELLED' : 'EXECUTION_ERROR',
-        message: error instanceof Error ? error.message : String(error),
+        //
+        // Otherwise, the kind the failure DECLARES, if it is one an executor
+        // is permitted to declare — NOT_FOUND, TIMEOUT, WINDOW_NOT_FOUND and
+        // the rest. Everything used to land here as EXECUTION_ERROR, and a
+        // model handed one undifferentiated failure told the user "it timed
+        // out" about things that had not. `declaredFailureKind` refuses any
+        // kind that is the dispatcher's own to establish (DENIED,
+        // APPROVAL_MISMATCH, DUPLICATE_SIDE_EFFECT, ...), so an executor can
+        // describe what went wrong but cannot forge an approval outcome.
+        kind: executionSignal.aborted ? 'CANCELLED' : (declaredFailureKind(error) ?? 'EXECUTION_ERROR'),
+        message: describeExecutionError(error),
+        // The raw error still goes to the log, in full. What changes above is
+        // only what the MODEL is handed, and therefore what a room hears.
         detail: toJsonValue(error),
       });
     } finally {
-      this.states.settle(`${tool.name} finished`);
+      this.states.settle('Done');
     }
   }
 
@@ -439,16 +560,30 @@ export class Dispatcher {
    * a check that could not be completed has not established anything, which
    * is the same deny-by-default rule `assessRisk` applies to risk.
    */
-  private precheck(tool: RegisteredTool, input: unknown): { ok: true } | { ok: false; reason: string; retryable: boolean } {
+  private precheck(
+    tool: RegisteredTool,
+    input: unknown,
+  ):
+    | { ok: true }
+    | { ok: false; reason: string; retryable: boolean; kind: ExecutorFailureKind | null; clarify: boolean } {
     if (!tool.precheck) return { ok: true };
     let verdict: PrecheckVerdict;
     try {
       verdict = tool.precheck(input);
     } catch (error) {
+      if (isClarificationRequired(error)) {
+        return { ok: false, reason: error.message, retryable: false, kind: null, clarify: true };
+      }
       const message = error instanceof Error ? error.message : String(error);
-      return { ok: false, reason: `${tool.name} could not confirm its preconditions: ${message}`, retryable: true };
+      return { ok: false, reason: `${tool.name} could not confirm its preconditions: ${message}`, retryable: true, kind: null, clarify: false };
     }
-    return verdict.ok ? { ok: true } : { ok: false, reason: verdict.reason, retryable: verdict.retryable };
+    if (verdict.ok) return { ok: true };
+    // The declared kind is honoured only if an executor may declare it.
+    const kind =
+      typeof verdict.kind === 'string' && (EXECUTOR_FAILURE_KINDS as readonly string[]).includes(verdict.kind)
+        ? verdict.kind
+        : null;
+    return { ok: false, reason: verdict.reason, retryable: verdict.retryable, kind, clarify: verdict.clarify === true };
   }
 
   /**
@@ -553,10 +688,10 @@ export class Dispatcher {
     }
   }
 
-  private contextFor(call: ToolCall): ToolExecutionContext {
+  private contextFor(call: ToolCall, signal: AbortSignal): ToolExecutionContext {
     return {
       callId: call.callId,
-      signal: this.signalFor(),
+      signal,
       observe: (summary: string, detail?: JsonValue): void => {
         this.bus.emit({
           type: 'OBSERVATION',

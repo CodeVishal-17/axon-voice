@@ -30,7 +30,14 @@ import {
   createWindowMinimizeTool,
 } from '../src/main/tools/executors/windows.js';
 import { APP_KEYS } from '../src/main/tools/executors/app-registry.js';
+import { createAppOpenTool } from '../src/main/tools/executors/app-open.js';
 import { parseWindows, type DesktopWindow, type DesktopWindows, type WindowAction } from '../src/main/platform/windows-desktop.js';
+
+const noopStates: StateController = {
+  enterExecuting: () => {},
+  enterAwaitingApproval: () => {},
+  settle: () => {},
+};
 
 // ---------------------------------------------------------------------------
 
@@ -298,7 +305,13 @@ describe('app.focus names an application, never a window', () => {
     const result = await h.run('app.focus', { app: 'notepad' });
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error('unreachable');
-    expect(result.failure.message).toMatch(/cannot tell which one/i);
+    // ASK, DO NOT GUESS. Phase 3 made the distinction reach the user: this is
+    // not a failure to apologise for, it is a question, and the failure kind
+    // is what carries that all the way to what gets said out loud.
+    expect(result.failure.kind).toBe('CLARIFICATION_NEEDED');
+    expect(result.failure.message).toMatch(/which one do you mean/i);
+    // And it names the candidates, so the question is answerable.
+    expect(result.failure.message).toContain('notes.txt - Notepad');
     expect(rig.acts).toHaveLength(0);
   });
 
@@ -444,11 +457,28 @@ describe('the desktop query runs a constant program', () => {
     expect(seen).toHaveLength(0);
   });
 
-  it('treats a failed query as an empty desktop rather than a crash', async () => {
+  it('reports a failed query as a failure — never as an empty desktop, and never as a crash', async () => {
+    // CHANGED DELIBERATELY, with the Phase 2 error taxonomy. This used to
+    // assert `list()` resolved [] on failure — "a listing that failed is an
+    // empty listing". `app.focus` then read that empty list as "Calculator
+    // does not appear to be running", so a slow PowerShell start reached the
+    // user as a false statement about their desktop. A failed listing has
+    // established nothing, and now says so. The original intent holds: it is
+    // not a crash. It is a rejection the dispatcher turns into a structured
+    // tool failure, and the callers that can tolerate a missing listing
+    // (launch verification, the post-act re-check) catch it.
     const { WindowsDesktop } = await import('../src/main/platform/windows-desktop.js');
-    const desktop = new WindowsDesktop({ run: () => Promise.reject(new Error('boom')) });
-    await expect(desktop.list()).resolves.toEqual([]);
-    await expect(desktop.act('1', 'focus')).resolves.toBe(false);
+    const { ToolError } = await import('@axon/core');
+
+    const broken = new WindowsDesktop({ run: () => Promise.reject(new Error('boom')) });
+    await expect(broken.list()).rejects.toThrow('Axon could not read the list of open windows.');
+
+    // A timeout says it is one — the only failure allowed to.
+    const slow = new WindowsDesktop({ run: () => Promise.reject(new ToolError('TIMEOUT', 'too slow')) });
+    await expect(slow.list()).rejects.toMatchObject({ toolFailureKind: 'TIMEOUT' });
+
+    // Acting is unchanged: a refused act is `false`, and the tool re-checks.
+    await expect(broken.act('1', 'focus')).resolves.toBe(false);
   });
 
   it('does nothing at all when the platform is not Windows', async () => {
@@ -461,3 +491,163 @@ describe('the desktop query runs a constant program', () => {
 
 // Keeps `vi` referenced for the config's strict unused checks in this file.
 void vi;
+
+
+// ---------------------------------------------------------------------------
+// app.open verifies against a window, not against a pid
+// ---------------------------------------------------------------------------
+
+/**
+ * "Calculator is open" has to be established, not assumed.
+ *
+ * `CreateProcess` returning a pid means the operating system agreed to start
+ * something. It does not mean an application opened: the executable can exit
+ * immediately, a policy can block it, an installer can be pending, another
+ * instance can take the launch and do nothing visible.
+ *
+ * Reporting success from a pid is reporting Axon's own optimism, and it is the
+ * same defect as claiming a page loaded because a navigation was requested —
+ * which is a mistake this codebase has already made once, in the browser, and
+ * fixed there for the same reason.
+ */
+describe('app.open establishes that the window appeared', () => {
+  function openHarness(windows: readonly DesktopWindow[], options: { readonly available?: boolean } = {}) {
+    const launched: string[] = [];
+    let current = [...windows];
+
+    const desktop: DesktopWindows = {
+      available: options.available ?? true,
+      list: () => Promise.resolve([...current]),
+      act: () => Promise.resolve(true),
+    };
+
+    const bus = new EventBus();
+    const events: AxonEvent[] = [];
+    bus.subscribe((event) => events.push(event));
+
+    const registry = new ToolRegistry();
+    registry.register(
+      createAppOpenTool(
+        {
+          launchExecutable: (file) => {
+            launched.push(file);
+            return Promise.resolve({ pid: 4242 });
+          },
+          openUri: (uri) => {
+            launched.push(uri);
+            return Promise.resolve();
+          },
+        },
+        { desktop, verifyTimeoutMs: 120, verifyIntervalMs: 20 },
+      ),
+    );
+
+    const approvals = new ApprovalBroker();
+    const dispatcher = new Dispatcher({
+      registry,
+      policy: new Policy(),
+      approvals,
+      bus,
+      states: noopStates,
+      approvalTimeoutMs: 1_000,
+    });
+
+    return {
+      events,
+      launched,
+      appear: (window: DesktopWindow) => {
+        current = [...current, window];
+      },
+      run: (app: string): Promise<ToolResult> =>
+        dispatcher.dispatch({ callId: newCallId(), tool: 'app.open', input: { app } as never }),
+    };
+  }
+
+  it('says it is open when a window for it is actually there', async () => {
+    const h = openHarness([win({ handle: '2001', title: 'Calculator' })]);
+    const result = await h.run('calculator');
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const verified = (result.output as { verified: { opened: boolean; window: string; summary: string } }).verified;
+    expect(verified.opened).toBe(true);
+    expect(verified.window).toBe('Calculator');
+    expect(verified.summary).toBe('Calculator is open.');
+  });
+
+  it('waits for a window that takes a moment to appear', async () => {
+    // Applications are not instant. Verification that gave up immediately
+    // would report every cold start as a failure.
+    const h = openHarness([]);
+    setTimeout(() => h.appear(win({ handle: '2002', title: 'Untitled - Notepad' })), 40);
+
+    const result = await h.run('notepad');
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect((result.output as { verified: { opened: boolean } }).verified.opened).toBe(true);
+  });
+
+  it('does NOT say it is open when no window ever appears', async () => {
+    // The failure this whole change exists for. The launch "succeeded" — a pid
+    // came back — and nothing opened.
+    const h = openHarness([]);
+    const result = await h.run('calculator');
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const verified = (result.output as { verified: { opened: boolean; window: null; summary: string } }).verified;
+
+    expect(h.launched).toHaveLength(1);
+    expect(verified.opened).toBe(false);
+    expect(verified.window).toBeNull();
+    expect(verified.summary).toMatch(/do not say it is open/i);
+  });
+
+  it('is not fooled by some other application being open', async () => {
+    const h = openHarness([win({ handle: '2003', title: 'Untitled - Notepad' })]);
+    const result = await h.run('calculator');
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect((result.output as { verified: { opened: boolean } }).verified.opened).toBe(false);
+  });
+
+  it('says it could not check, rather than claiming success, where it cannot look', async () => {
+    // Off Windows there is no window list. "I started it and cannot check" is
+    // true; "it is open" would not be.
+    const h = openHarness([], { available: false });
+    const result = await h.run('calculator');
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const verified = (result.output as { verified: { opened: boolean; summary: string } }).verified;
+    expect(verified.opened).toBe(false);
+    expect(verified.summary).toMatch(/cannot check the desktop/i);
+    expect(verified.summary).toMatch(/do not claim it is open/i);
+  });
+
+  it('records what it established in the timeline, either way', async () => {
+    const opened = openHarness([win({ handle: '2004', title: 'Calculator' })]);
+    await opened.run('calculator');
+    expect(
+      opened.events.some((event) => event.type === 'OBSERVATION' && /is open/.test(event.summary)),
+    ).toBe(true);
+
+    const missing = openHarness([]);
+    await missing.run('calculator');
+    expect(
+      missing.events.some((event) => event.type === 'OBSERVATION' && /no window appeared/.test(event.summary)),
+    ).toBe(true);
+  });
+
+  it('still refuses anything outside the allowlist, unchanged', async () => {
+    // Verification is an addition, not a relaxation.
+    const h = openHarness([]);
+    for (const hostile of ['powershell', 'cmd.exe', 'C:/Windows/System32/cmd.exe', 'chrome']) {
+      const result = await h.run(hostile);
+      expect(result.ok, hostile).toBe(false);
+      if (!result.ok) expect(result.failure.kind).toBe('INVALID_INPUT');
+    }
+    expect(h.launched).toEqual([]);
+  });
+});

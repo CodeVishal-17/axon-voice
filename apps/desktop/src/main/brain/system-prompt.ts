@@ -16,7 +16,7 @@
  *   because a prompt alone is not a guarantee.
  */
 
-import type { SessionContext, ToolSchema } from '@axon/core';
+import { AXON_IDENTITY, identityInstructions, renderMemoryLines, type SessionContext, type ToolSchema } from '@axon/core';
 
 export interface SystemPromptOptions {
   readonly tools: readonly ToolSchema[];
@@ -41,15 +41,15 @@ export function buildSystemPrompt(options: SystemPromptOptions): string {
 
   const context = options.context ?? null;
 
-  // Rendered as one line per memory rather than as prose, so a value
-  // containing a colon or a newline cannot restructure the prompt around it.
-  const memoryLines = (context?.memories ?? []).map(
-    (memory) => `- ${memory.category}: ${memory.key} — ${memory.value}`,
-  );
+  // One line per memory, from the renderer the voice agent uses too.
+  const memoryLines = renderMemoryLines(context?.memories ?? []);
 
   return [
-    'You are Axon, a desktop AI agent running on the user\'s own computer.',
+    // Identity from the one source both prompts share. See `identity.ts` in core.
+    `You are ${AXON_IDENTITY.name}, ${AXON_IDENTITY.role}, running on the user's own computer.`,
     `The computer is running ${options.platform}.`,
+    '',
+    ...identityInstructions(),
     '',
     'You act by calling tools. This is the complete list of things you can do:',
     toolLines,

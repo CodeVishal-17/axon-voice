@@ -198,6 +198,36 @@ export interface VoiceAgentStatus {
    * waiting for you to say its name, on this machine".
    */
   readonly armed: boolean;
+  /**
+   * What is doing the listening, and whether it is well.
+   *
+   * Bounded and printable by construction: an engine name, a short
+   * description, a restart count, and two booleans. There is no channel here
+   * for anything anybody said — a wake detector that could report text would
+   * be a wake detector that had transcribed a room.
+   */
+  readonly wake: WakeStatus;
+}
+
+/**
+ * The local wake detector's health, as the tray and the settings panel see it.
+ *
+ * Lives in core because the renderer renders it, and the renderer must never
+ * import anything from `main/wake/`.
+ */
+export interface WakeStatus {
+  /** 'keyword-spotter', 'windows-speech', or 'disabled'. */
+  readonly engine: string;
+  /** The runtime doing the hearing, in a few words. Never a path, never audio. */
+  readonly detail: string;
+  /** False when this machine cannot run the engine at all. */
+  readonly available: boolean;
+  /** Why it cannot listen, when it cannot. Phrased for a person. */
+  readonly unavailableReason: string | null;
+  /** How many times the engine has had to be restarted under it. */
+  readonly restarts: number;
+  /** True while armed and no microphone audio has arrived recently. */
+  readonly starvedOfAudio: boolean;
 }
 
 /**

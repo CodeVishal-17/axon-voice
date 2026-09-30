@@ -17,7 +17,7 @@
  * `memory-policy.test.ts` exercise the third.
  */
 
-import { PERSISTENCE_LIMITS, type MemorySensitivity, type MemorySource } from '@axon/core';
+import { PERSISTENCE_LIMITS, classifyText, type MemorySensitivity, type MemorySource } from '@axon/core';
 import { containsSecret } from './redaction.js';
 
 /** Why a memory was refused. A closed set, so callers can react. */
@@ -47,31 +47,6 @@ export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 export function isMemoryCategory(value: unknown): value is MemoryCategory {
   return typeof value === 'string' && (MEMORY_CATEGORIES as readonly string[]).includes(value);
 }
-
-/**
- * Hints that a memory is about the person rather than the work.
- *
- * Only affects CLASSIFICATION, never whether the memory is stored. It marks a
- * row so the UI can flag it, and so someone screen-sharing knows what is on
- * display. Getting this wrong is a cosmetic error, not a security one — which
- * is why it is allowed to be a word list.
- */
-const PERSONAL_HINTS = [
-  'address',
-  'phone',
-  'birthday',
-  'email',
-  'family',
-  'partner',
-  'wife',
-  'husband',
-  'child',
-  'medical',
-  'health',
-  'salary',
-  'bank',
-  'home',
-];
 
 /**
  * Characters refused outright in a stored memory.
@@ -154,10 +129,21 @@ export function evaluateMemory(input: {
   return { ok: true, category: input.category, key, value, sensitivity: classify(input.category, key, value) };
 }
 
-/** Ordinary or personal. `secret` is never returned: those are refused above. */
+/**
+ * Ordinary or personal. `secret` is never returned: those are refused above.
+ *
+ * A LABEL, NOT A GATE, and the distinction is the point. `personal` marks a
+ * row so the UI can flag it and so somebody screen-sharing knows what is on
+ * display. It never stops a memory being stored. An email address is personal
+ * information Axon is perfectly able to remember when asked; treating it as
+ * something to refuse is the confusion `sensitivity.ts` in core was written to
+ * end.
+ *
+ * The classification now comes from that shared vocabulary rather than a local
+ * word list, so "what counts as personal" has one answer across the memory
+ * layer, the desktop input tools and the timeline.
+ */
 function classify(category: MemoryCategory, key: string, value: string): MemorySensitivity {
   if (category === 'person') return 'personal';
-
-  const haystack = `${key} ${value}`.toLowerCase();
-  return PERSONAL_HINTS.some((hint) => haystack.includes(hint)) ? 'personal' : 'ordinary';
+  return classifyText(`${key} ${value}`).sensitivity === 'PERSONAL' ? 'personal' : 'ordinary';
 }

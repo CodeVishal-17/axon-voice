@@ -91,7 +91,78 @@ export interface CaptureCommand {
   /** Always `LISTENING_LIMITS.sampleRate`; carried so the renderer's
    *  resampler has a single source of truth rather than a second constant. */
   readonly sampleRate: number;
+  /**
+   * Report numeric capture diagnostics for this session (development builds
+   * with AXON_VOICE_DEBUG or AXON_WAKE_DEBUG only). Absent means no reports.
+   */
+  readonly diagnostics?: boolean;
+  /**
+   * Explicit microphone processing, for a controlled A/B in a development
+   * build. Absent — always, in a packaged build — means the defaults: all three
+   * on. Decided by main; the renderer cannot ask for it.
+   */
+  readonly processing?: CaptureProcessing;
 }
+
+/** The browser's microphone processing switches. */
+export interface CaptureProcessing {
+  readonly echoCancellation: boolean;
+  readonly noiseSuppression: boolean;
+  readonly autoGainControl: boolean;
+}
+
+/**
+ * What the capture page measured about its own microphone, over one window.
+ *
+ * NUMBERS ONLY, and every one of them is about format or timing or loudness —
+ * never a sample. It exists because "the transcription is wrong" has a dozen
+ * possible causes before the audio ever reaches a recognizer: the wrong sample
+ * rate, a resampler, a callback that the page's main thread could not service
+ * in time, gain processing, silence. Each of those shows up here as a number
+ * and none of them requires recording anybody to see.
+ */
+export interface CaptureDiagnostics {
+  readonly captureId: string;
+  /**
+   * Which capture path produced the audio. `track-processor` reads the
+   * microphone track directly; `script-processor` is the Web Audio fallback,
+   * measured falling behind real time once its silent output is suspended.
+   */
+  readonly pipeline: 'track-processor' | 'script-processor';
+  /** What main asked for. */
+  readonly targetSampleRate: number;
+  /** The rate audio arrives at before conversion: the track's frames, or the AudioContext on the fallback. */
+  readonly contextSampleRate: number;
+  /** What the microphone track reports (may be null where the browser does not say). */
+  readonly trackSampleRate: number | null;
+  readonly trackChannelCount: number | null;
+  readonly echoCancellation: boolean | null;
+  readonly noiseSuppression: boolean | null;
+  readonly autoGainControl: boolean | null;
+  /** Wall-clock length of this window. */
+  readonly windowMs: number;
+  /** Processing callbacks the page received in the window. */
+  readonly callbacks: number;
+  /** Audio the page produced, in milliseconds at the target rate. */
+  readonly producedMs: number;
+  /** How far the AudioContext's own clock advanced. Equal to `windowMs` when the device is healthy. */
+  readonly audioClockMs: number;
+  /** Longest wall-clock gap between two callbacks. A few block lengths is normal; more is starvation. */
+  readonly maxCallbackGapMs: number;
+  /** RMS and peak of what was produced, 0..1. */
+  readonly rms: number;
+  readonly peak: number;
+  /** Callbacks whose peak was below the silence floor. */
+  readonly silentCallbacks: number;
+  /** Samples at or beyond full scale before conversion. */
+  readonly clippedSamples: number;
+}
+
+/** Bounds on a diagnostics report, so the page cannot use the channel as anything else. */
+export const CAPTURE_DIAGNOSTICS_LIMITS = {
+  /** How often the page reports while capturing. */
+  intervalMs: 2_000,
+} as const;
 
 /**
  * Why a capture could not run.

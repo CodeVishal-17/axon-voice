@@ -1,0 +1,77 @@
+<!doctype html>
+<!--
+  Axon demo site — a static stand-in for "my internship application".
+
+  WHY THIS EXISTS. The canonical demo's third act fills in an application
+  form. In the test suite that form is a page model at careers.example.com,
+  which does not exist on the internet. On stage it has to be a real page,
+  on a real public https address — Axon's URL policy refuses localhost and
+  private addresses, deliberately, and that is not relaxed for a demo.
+
+  So host this folder anywhere static and public (GitHub Pages works), and
+  point the demo at it. See DEMO_SETUP.md.
+
+  It mirrors the test fixture: the same labels, the same requirements, a
+  password field that is a real <input type="password"> (which Axon's page
+  reader marks sensitive and refuses to type into), and a submit button.
+  There is no script. Submitting sends the form by GET to the thank-you page;
+  the password and national insurance fields have no `name`, so even a
+  submission made by hand never puts them in a URL.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Apply — Summer Internship</title>
+    <style>
+      body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1b1f24; }
+      h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+      ul { padding-left: 1.2rem; }
+      label { display: block; margin-top: 1rem; font-weight: 600; }
+      input, textarea { width: 100%; box-sizing: border-box; padding: 0.5rem; font: inherit; }
+      .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; flex-wrap: wrap; }
+      button { padding: 0.6rem 1rem; font: inherit; }
+      .note { color: #57606a; font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Summer Internship — Application</h1>
+    <p>What we need from you:</p>
+    <ul>
+      <li>Your full name</li>
+      <li>An email address we can reach you on</li>
+      <li>The university you attend</li>
+      <li>A short answer: why do you want this role?</li>
+      <li>A CV, uploaded as a PDF</li>
+      <li>A password, so you can come back and edit this later</li>
+      <li>Your national insurance number, for right-to-work checks</li>
+    </ul>
+    <p class="note">Applications close on the 30th. You can save and return at any time.</p>
+
+    <form action="../submitted/" method="get">
+      <label for="full-name">Full name</label>
+      <input id="full-name" name="name" type="text" autocomplete="off" />
+
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email" autocomplete="off" />
+
+      <label for="university">University</label>
+      <input id="university" name="university" type="text" autocomplete="off" />
+
+      <label for="why">Why do you want this role?</label>
+      <textarea id="why" name="why" rows="4"></textarea>
+
+      <label for="password">Create a password</label>
+      <input id="password" type="password" autocomplete="new-password" />
+
+      <label for="ni">National insurance number</label>
+      <input id="ni" type="text" autocomplete="off" />
+
+      <div class="actions">
+        <button type="button">Upload CV</button>
+        <button type="button">Save draft</button>
+        <button type="submit">Submit application</button>
+      </div>
+    </form>
+  </body>
+</html>

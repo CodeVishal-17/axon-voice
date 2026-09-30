@@ -17,9 +17,11 @@
  * which uses it once for an Authorization header and never exposes it.
  */
 
-import type { JsonValue, ToolCall, ToolResult, ToolSchema, VoiceAgentPhase, SpeechChunk } from '@axon/core';
+import type { ContextMemory, JsonValue, ToolCall, ToolResult, ToolSchema, VoiceAgentPhase, SpeechChunk } from '@axon/core';
 import { VoiceAgentSession } from './voice-agent-session.js';
+import type { TaskLedger } from './task-ledger.js';
 import type { VoiceSocketError } from './assemblyai-client.js';
+import type { ReplyAudioEvent, ReplySummary } from './reply-audio.js';
 
 export interface VoiceAgentFactoryOptions {
   /** Read from ASSEMBLYAI_API_KEY by the caller. Empty means "not configured". */
@@ -33,14 +35,34 @@ export interface VoiceAgentFactoryOptions {
 /** What the session needs that only the orchestrator can supply. */
 export interface VoiceAgentWiring {
   readonly tools: readonly ToolSchema[];
+  /**
+   * What the user has approved Axon to remember, recalled at session start.
+   *
+   * Absent before this existed: the voice path was never given a single
+   * memory, so a fact saved in one conversation could not be answered in the
+   * next. Recalled once, read-only, already bounded by the persistence layer —
+   * this module still has no route to the database.
+   */
+  readonly memories?: readonly ContextMemory[];
   dispatch(call: ToolCall): Promise<ToolResult>;
   willRequireApproval(tool: string, input: JsonValue): boolean;
+  /** One line describing a pending approval. Read-only, like the line above. */
+  describeApproval?(tool: string, input: JsonValue): string | null;
+  /** What Axon is currently doing. Owned by the orchestrator; read here. */
+  readonly tasks: TaskLedger;
   onUserTranscript(text: string): void;
   onAgentTranscript(text: string): void;
   onAudioChunk(chunk: SpeechChunk): void;
   onPhase(phase: VoiceAgentPhase, detail: string): void;
   onNotice(summary: string): void;
   onClosed(error: VoiceSocketError | null): void;
+  /** Developer diagnostics; see `VoiceAgentSessionOptions`. */
+  onAudioSent?(bytes: number, bufferedBytes: number): void;
+  onAudioDropped?(bytes: number, reason: 'not-ready' | 'no-socket'): void;
+  onUserTranscriptDelta?(text: string): void;
+  /** Developer diagnostics for the reply direction; see `reply-audio.ts`. */
+  onReplyAudio?(event: ReplyAudioEvent): void;
+  onReplySummary?(summary: ReplySummary): void;
 }
 
 /**

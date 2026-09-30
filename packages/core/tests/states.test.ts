@@ -59,6 +59,23 @@ describe('legal transitions', () => {
     expect(isLegalTransition(from, to)).toBe(true);
   });
 
+  it.each([
+    ['THINKING', 'LISTENING'],
+    ['EXECUTING', 'LISTENING'],
+  ] as const)('lets the microphone reopen: %s -> %s', (from, to) => {
+    // A live voice session reopens the microphone the instant the model's
+    // turn ends, and a user can talk over a tool that is still running. Both
+    // of those are ordinary, and refusing them left the orb showing "working"
+    // while Axon was in fact listening.
+    expect(isLegalTransition(from, to)).toBe(true);
+  });
+
+  it('does not let a pending approval be replaced by listening', () => {
+    // The one place the microphone reopening must NOT take the screen: an
+    // unanswered approval is the more important thing on it.
+    expect(isLegalTransition('WAITING_FOR_APPROVAL', 'LISTENING')).toBe(false);
+  });
+
   it('allows every state to fail into ERROR', () => {
     for (const state of AXON_STATES) {
       if (state === 'ERROR') continue;

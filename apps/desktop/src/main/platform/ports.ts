@@ -18,8 +18,16 @@ export interface LaunchedApp {
 export interface AppLauncher {
   /** Start an executable by name/path with no arguments. */
   launchExecutable(file: string): Promise<LaunchedApp>;
-  /** Hand a URI to the OS handler (used for `ms-settings:`). */
+  /** Hand a URI to the OS handler (used for `ms-settings:`, and by `web.open`). */
   openUri(uri: string): Promise<void>;
+  /**
+   * Start an application Axon DISCOVERED, by its Start-menu AppID.
+   *
+   * The AppID is never model-supplied: it comes from Axon's own catalog
+   * (`apps/app-catalog.ts`), which read it from the OS. Optional, so a
+   * platform without a Start menu simply has no discovered applications.
+   */
+  launchStartMenuApp?(appId: string): Promise<void>;
 }
 
 export interface CapturedScreen {

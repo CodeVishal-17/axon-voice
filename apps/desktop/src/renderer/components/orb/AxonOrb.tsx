@@ -1,28 +1,29 @@
 /**
- * React wrapper around the orb renderer.
+ * The orb, as a React component.
  *
- * Deliberately thin. It mounts the canvas, hands the renderer the current Axon
- * state, and keeps the backing store in step with the element's size. There is
- * no animation logic here at all — the engine in `orb-renderer.ts` owns that,
- * so the visuals can be reasoned about, tuned and reused without React in the
- * way, and a re-render can never restart or perturb the animation.
+ * A thin shell around `OrbRenderer`: it mounts the canvas once and pushes
+ * state, amplitude and theme changes into the long-lived renderer rather than
+ * rebuilding it. The canvas is decorative (`aria-hidden`) — the state it shows
+ * is always stated in words beside it.
  */
 
 import { useEffect, useRef } from 'react';
 import type { AxonState } from '@axon/core';
-import { OrbRenderer } from './orb-renderer.js';
+import { OrbRenderer, type OrbTheme } from './orb-renderer.js';
 import { SilentAmplitudeSource, type AmplitudeSource } from './amplitude.js';
 
 export interface AxonOrbProps {
   readonly state: AxonState;
   /**
-   * Live level for the reactive parts of the animation. Defaults to silence
-   * until the microphone (Step 4) and speech playback (Step 3) are connected.
+   * Live level for the reactive parts of the animation: the microphone while
+   * listening, the speakers while speaking. Absent means the orb uses only
+   * its own intrinsic motion — it never animates to a fake signal.
    */
   readonly amplitude?: AmplitudeSource;
+  readonly theme?: OrbTheme;
 }
 
-export function AxonOrb({ state, amplitude }: AxonOrbProps): React.JSX.Element {
+export function AxonOrb({ state, amplitude, theme = 'dark' }: AxonOrbProps): React.JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rendererRef = useRef<OrbRenderer | null>(null);
 
@@ -33,6 +34,7 @@ export function AxonOrb({ state, amplitude }: AxonOrbProps): React.JSX.Element {
     const renderer = new OrbRenderer(canvas, amplitude ?? new SilentAmplitudeSource());
     rendererRef.current = renderer;
     renderer.setState(state);
+    renderer.setTheme(theme);
     renderer.start();
 
     const observer = new ResizeObserver(() => {
@@ -45,8 +47,7 @@ export function AxonOrb({ state, amplitude }: AxonOrbProps): React.JSX.Element {
       renderer.stop();
       rendererRef.current = null;
     };
-    // Mount-only: the renderer is long-lived, and state/amplitude changes are
-    // pushed to it by the effects below rather than by rebuilding it.
+    // Mount-only: the renderer is long-lived; the effects below push changes.
   }, []);
 
   useEffect(() => {
@@ -54,8 +55,12 @@ export function AxonOrb({ state, amplitude }: AxonOrbProps): React.JSX.Element {
   }, [state]);
 
   useEffect(() => {
-    if (amplitude) rendererRef.current?.setAmplitudeSource(amplitude);
+    rendererRef.current?.setAmplitudeSource(amplitude ?? new SilentAmplitudeSource());
   }, [amplitude]);
+
+  useEffect(() => {
+    rendererRef.current?.setTheme(theme);
+  }, [theme]);
 
   return <canvas ref={canvasRef} className="orb-canvas" aria-hidden="true" />;
 }

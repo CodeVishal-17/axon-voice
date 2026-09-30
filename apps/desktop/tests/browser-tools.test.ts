@@ -476,7 +476,10 @@ describe('clicking is classified from Axon\'s record of the page', () => {
     const result = await h.run('browser.click', { ref: 'e4' });
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error('unreachable');
-    expect(result.failure.message).toMatch(/cannot tell which one/i);
+    // Refused, and refused as a QUESTION rather than as a fault — clicking
+    // either of two matching elements would be Axon choosing for the user.
+    expect(result.failure.kind).toBe('CLARIFICATION_NEEDED');
+    expect(result.failure.message).toMatch(/which one do you mean/i);
   });
 
   it('rejects a reference that is not a reference', async () => {

@@ -7,6 +7,11 @@ out/
 .env
 .env.local
 
+# The local wake-word model: 18 MB of ONNX, fetched and hash-verified by
+# `npm run wake:model`. Too big for git, and pinned by content hash in
+# `scripts/fetch-wake-model.cjs` so it does not need to be in git to be trusted.
+apps/desktop/resources/wake-model/
+
 # Axon runtime data (event logs, screenshots, agent workspace)
 .axon-runtime/
 artifacts/

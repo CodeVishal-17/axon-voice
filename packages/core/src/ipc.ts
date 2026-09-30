@@ -24,9 +24,10 @@ import type { AxonState } from './states.js';
 import type { ApprovalDecision, ApprovalRequest } from './approval.js';
 import type { JsonValue } from './json.js';
 import type { ToolResult, ToolSchema } from './tool-contract.js';
-import type { SpeechDelivery, SpeechReport, SpeechStatus } from './speech.js';
+import type { PlaybackDiagnostics, SpeechDelivery, SpeechReport, SpeechStatus } from './speech.js';
 import type {
   CaptureCommand,
+  CaptureDiagnostics,
   CaptureReport,
   ListeningStatus,
   StartListeningResult,
@@ -74,6 +75,7 @@ export const IPC_CHANNELS = {
   SPEECH_STOP: 'axon:speech:stop',
   /** renderer -> main: advisory playback progress. Main is still authoritative. */
   SPEECH_REPORT: 'axon:speech:report',
+  SPEECH_PLAYBACK_DIAGNOSTICS: 'axon:speech:diagnostics',
   /** renderer -> main: stop speaking (the UI's stop button). */
   SPEECH_CANCEL: 'axon:speech:cancel',
   /** renderer -> main: ask to start listening. Main decides. */
@@ -92,6 +94,14 @@ export const IPC_CHANNELS = {
   LISTEN_AUDIO: 'axon:listen:audio',
   /** renderer -> main: microphone opened, closed, or failed to open. */
   LISTEN_REPORT: 'axon:listen:report',
+  /**
+   * renderer -> main: numeric capture diagnostics (`CaptureDiagnostics`).
+   *
+   * Sent only when a capture command asked for them, which main does only in a
+   * development build with voice or wake debugging on. Format, timing and
+   * loudness numbers — never a sample.
+   */
+  LISTEN_DIAGNOSTICS: 'axon:listen:diagnostics',
 
   /**
    * The voice-agent surface.
@@ -127,6 +137,24 @@ export const IPC_CHANNELS = {
   SETTINGS_UPDATE: 'axon:settings:update',
   SETTINGS_RESET: 'axon:settings:reset',
   PROFILE_UPDATE: 'axon:profile:update',
+  WINDOW_APPEARANCE: 'axon:window:appearance',
+
+  /**
+   * The overlay: Axon's bottom-centre orb, and the one window that holds the
+   * microphone and the speaker.
+   *
+   * PHASE is main telling the overlay to animate in or out — main alone decides
+   * when Axon is active. INTERACTIVE is the overlay saying the pointer is over
+   * one of its own controls, so its transparent window can take that click
+   * instead of passing it through. Neither can show, move or focus anything
+   * else.
+   */
+  OVERLAY_PHASE: 'axon:overlay:phase',
+  OVERLAY_INTERACTIVE: 'axon:overlay:interactive',
+
+  /** Whether Axon starts in the background when the user signs in. Per user. */
+  STARTUP_GET: 'axon:startup:get',
+  STARTUP_SET: 'axon:startup:set',
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
@@ -179,6 +207,16 @@ export interface StateRequestResult {
   readonly accepted: boolean;
   readonly state: AxonState;
   readonly error: string | null;
+}
+
+/** The overlay arriving (`enter`) or leaving (`leave`). */
+export type OverlayPhase = 'enter' | 'leave';
+
+/** Whether Axon starts at sign-in, and why that cannot be changed when it cannot. */
+export interface StartupStatus {
+  readonly available: boolean;
+  readonly enabled: boolean;
+  readonly reason: string | null;
 }
 
 /**
@@ -235,6 +273,14 @@ export interface AxonBridge {
   onSpeechStop(listener: (speechId: string) => void): () => void;
   /** Tell main how playback is going. Advisory — main runs its own watchdog. */
   reportSpeech(report: SpeechReport): Promise<void>;
+  /**
+   * How the voice agent's streamed reply is playing: first chunk received,
+   * started, ended, failed. Fire and forget, numbers and fixed words only,
+   * rebuilt field by field in the preload, validated strictly in main and
+   * dropped unless a development build asked for voice diagnostics. It grants
+   * nothing: it cannot start, stop or name audio.
+   */
+  reportPlaybackDiagnostics(report: PlaybackDiagnostics): void;
   /** Ask main to stop speaking. Main decides and drives the state change. */
   cancelSpeech(): Promise<void>;
 
@@ -287,6 +333,13 @@ export interface AxonBridge {
   reportCapture(report: CaptureReport): Promise<void>;
 
   /**
+   * Numeric capture diagnostics, when main asked for them. Fire and forget.
+   * Numbers and booleans only, rebuilt field by field in the preload and
+   * validated strictly in main; dropped unless a debug build asked for them.
+   */
+  reportCaptureDiagnostics(report: CaptureDiagnostics): void;
+
+  /**
    * Conversations.
    *
    * The renderer can list, open, name and delete them. It cannot read a
@@ -317,4 +370,28 @@ export interface AxonBridge {
   updateSettings(patch: Partial<AxonSettings>): Promise<SettingsUpdateResult>;
   resetSettings(): Promise<SettingsUpdateResult>;
   updateProfile(patch: { displayName?: string | null; language?: string | null }): Promise<AxonProfile>;
+
+  /**
+   * Match the native window frame to the page's theme.
+   *
+   * One of two words and nothing else: the page can recolour its own title
+   * bar, not resize, move, focus or otherwise command the window.
+   */
+  setAppearance(appearance: 'dark' | 'light'): Promise<void>;
+
+  /**
+   * The bottom-centre orb arriving or leaving. Main decides when Axon is
+   * active; the overlay only animates. Returns an unsubscribe function.
+   */
+  onOverlayPhase(listener: (phase: OverlayPhase) => void): () => void;
+  /**
+   * Whether the pointer is over one of the overlay's own controls. Main keeps
+   * the transparent overlay click-through everywhere else; this can only make
+   * the overlay's own window take or pass a click. One boolean, no reply.
+   */
+  setOverlayInteractive(interactive: boolean): void;
+  /** Whether Axon starts in the background when the user signs in to Windows. */
+  getStartup(): Promise<StartupStatus>;
+  /** Turn that on or off. Per user, no administrator rights; main applies it. */
+  setStartup(enabled: boolean): Promise<StartupStatus>;
 }

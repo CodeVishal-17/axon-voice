@@ -58,6 +58,8 @@ function check(label, condition, detail) {
 }
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/** When the harness last saw a listening session close. See the reload check. */
+let listeningClosedAt = 0;
 
 async function main() {
   const outDir = path.resolve(__dirname, '../out/main');
@@ -138,6 +140,9 @@ async function main() {
     // listening
     'onCaptureCommand',
     'reportCapture',
+    // Numeric capture diagnostics: format, timing and loudness numbers, no
+    // audio, no reply, dropped by main unless a debug build asked for them.
+    'reportCaptureDiagnostics',
     'sendAudioFrame',
     'startListening',
     'stopListening',
@@ -160,6 +165,14 @@ async function main() {
     'setMemoryEnabled',
     'updateProfile',
     'updateSettings',
+    // appearance: one of two words, recolours the native frame only
+    'setAppearance',
+    // overlay and startup: an animation cue in, one boolean out, and a per-user
+    // sign-in toggle that main applies
+    'getStartup',
+    'onOverlayPhase',
+    'setOverlayInteractive',
+    'setStartup',
   ];
   check(
     'the bridge exposes exactly the audited surface',
@@ -267,6 +280,7 @@ async function main() {
         async () => (await run(`window.axon.getSnapshot().then((s) => s.listening.active)`)) === false,
         20_000,
       );
+      if (closed) listeningClosedAt = Date.now();
 
       const after = await run(`window.axon.getSnapshot().then((s) => ({ state: s.state, active: s.listening.active }))`);
       check('the session closed itself when nothing was said', closed && after.active === false);
@@ -358,6 +372,65 @@ async function main() {
   check('the JSONL log was written', logLines.length > 0, `${logLines.length} lines`);
   check('no log line contains audio', !logLines.some((line) => /"samples"|"pcm"/i.test(line)));
 
+  // --- the window reloads mid-session ---------------------------------------
+  // A reload destroys every microphone stream the page held without the page
+  // getting to say so. Main must notice, end what the page was holding, and
+  // come back ready: the orb must not sit on LISTENING with no audio, and the
+  // wake word must not stay "armed" and deaf.
+  if (status.available && !degraded) {
+    const before = await run(`window.axon.getSnapshot().then((s) => ({ armed: s.voiceAgent.armed }))`);
+    // From a quiet Axon. The session above may have heard real speech in the
+    // room and started a turn; asking to listen while that turn is finishing
+    // is refused — correctly — and would test the refusal, not the reload.
+    await until(async () => (await run(`window.axon.getSnapshot().then((s) => s.busy)`)) === false, 20_000);
+    // And past the listening service's restart cooldown (300 ms after a session
+    // ends). A request inside it is refused on purpose — no person asks again
+    // that fast — so making one would test the cooldown, not the reload. The
+    // steps above can now finish inside that window, which is how this check
+    // came to fail for a reason unrelated to reloading.
+    const sinceClosed = listeningClosedAt === 0 ? null : Date.now() - listeningClosedAt;
+    if (sinceClosed !== null && sinceClosed < 500) await wait(500 - sinceClosed);
+    const again = await run(`window.axon.startListening()`);
+    // Established, not assumed: the property is about a session that WAS
+    // open, so wait until one is before reloading.
+    const listeningBefore = await until(
+      async () => (await run(`window.axon.getSnapshot().then((s) => s.listening.active)`)) === true,
+      6_000,
+    );
+    check(
+      'a listening session was open before the reload',
+      listeningBefore,
+      `startListening: ${again.accepted ? 'accepted' : `refused (${again.error ?? 'no reason'})`}; ${sinceClosed ?? 'n/a'}ms after the last session closed`,
+    );
+
+    window.webContents.reload();
+    await wait(500);
+    await waitForLoad(window);
+    await wait(2_500);
+
+    const afterReload = await run(`window.axon.getSnapshot().then((s) => ({ state: s.state, active: s.listening.active, armed: s.voiceAgent.armed }))`);
+    check(
+      'a reload ends the listening session the page was holding',
+      listeningBefore && afterReload.active === false,
+      `after: active=${afterReload.active}`,
+    );
+    check('the orb does not stay on LISTENING after a reload', afterReload.state !== 'LISTENING', afterReload.state);
+
+    if (before.armed) {
+      const rearmed = await until(
+        async () => (await run(`window.axon.getSnapshot().then((s) => s.voiceAgent.armed)`)) === true,
+        10_000,
+      );
+      check('the wake word is listening again after the reload', rearmed);
+    }
+
+    // And the next ordinary request works without restarting anything.
+    const next = await run(`window.axon.startListening()`);
+    check('listening works again after the reload, with no restart', next.accepted === true, next.error ?? '');
+    await wait(1_500);
+    await run(`window.axon.stopListening()`);
+  }
+
   console.log(`\n${checks.length - failed}/${checks.length} checks passed`);
   if (degraded) {
     console.log(
@@ -396,7 +469,9 @@ function waitForWindow(timeoutMs = 15_000) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const poll = () => {
-      const [first] = BrowserWindow.getAllWindows();
+      // The overlay is the voice surface: the one page main sends capture
+      // commands and speech to, and accepts microphone audio from.
+      const first = BrowserWindow.getAllWindows().find((w) => /[?&]surface=overlay/.test(w.webContents.getURL()));
       if (first) return resolve(first);
       if (Date.now() - startedAt > timeoutMs) return resolve(null);
       setTimeout(poll, 100);

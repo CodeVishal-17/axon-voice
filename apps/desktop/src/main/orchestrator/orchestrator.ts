@@ -20,11 +20,15 @@
 import { randomUUID } from 'node:crypto';
 import {
   isLegalTransition,
+  matchesCancellation,
+  matchesLifecycleCommand,
   VOICE_AGENT_LIMITS,
   type ApprovalDecision,
   type AxonSnapshot,
   type AxonState,
   type Brain,
+  type LifecycleCommand,
+  type PlaybackDiagnostics,
   type BrainEventInput,
   type BrainStatus,
   type BrowserStatus,
@@ -41,6 +45,9 @@ import {
   type VoiceActivation,
   type VoiceAgentPhase,
   type VoiceAgentStatus,
+  type CaptureDiagnostics,
+  type CaptureProcessing,
+  type WakeStatus,
   type VoiceSessionResult,
   type WakeTrigger,
   type CaptureCommand,
@@ -52,6 +59,7 @@ import { ApprovalBroker } from '../safety/approval-broker.js';
 import { Policy } from '../safety/policy.js';
 import { AxonStateMachine } from './state-machine.js';
 import { TurnBudget } from '../safety/turn-budget.js';
+import { TaskLedger } from '../agent/task-ledger.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import { toToolSchemas } from '../tools/schema-view.js';
 import { describeModelError, toBrainErrorDetail } from '../brain/brain-errors.js';
@@ -62,6 +70,7 @@ import type { PersistenceService } from '../persistence/persistence-service.js';
 import type { VoiceAgentProvider } from '../agent/create-voice-agent.js';
 import type { VoiceAgentSession } from '../agent/voice-agent-session.js';
 import type { SpeechTransport } from '../voice/speech-transport.js';
+import type { ReplyAudioNote, ReplyNote, VoiceDiagnostics } from '../voice/voice-diagnostics.js';
 import type { MicGate } from '../voice/mic-gate.js';
 
 /**
@@ -74,10 +83,51 @@ import type { MicGate } from '../voice/mic-gate.js';
  */
 export interface WakeAudioSink {
   pushFrame(frame: Int16Array): void;
+  /**
+   * The detector's health, for the snapshot the renderer and the tray read.
+   *
+   * Part of the sink rather than a second binding so the orchestrator still
+   * holds exactly one reference to the wake subsystem, and so the shape of
+   * what it can learn from it stays visible here: a status object with no
+   * channel for audio or text.
+   */
+  getStatus(): WakeStatus;
+  /**
+   * Stop and start LOCAL listening for the wake phrase.
+   *
+   * The detector's own existing methods, reached so that "stop listening"
+   * can actually stop it — before this, nothing the user said could. They
+   * change whether the detector listens, never how it hears: no threshold,
+   * model, window or preprocessing is reachable from here. Optional because a
+   * sink that cannot be switched off simply is not switched off.
+   */
+  arm?(): Promise<boolean>;
+  disarm?(): void;
 }
+
+/** What the orchestrator reports when no detector has been attached. */
+const NO_WAKE_DETECTOR: WakeStatus = {
+  engine: 'disabled',
+  detail: 'no wake-word engine',
+  available: false,
+  unavailableReason: 'No wake-word detector is attached.',
+  restarts: 0,
+  starvedOfAudio: false,
+};
 
 export interface OrchestratorOptions {
   readonly bus: EventBus;
+  /**
+   * Numeric audio-path diagnostics (development builds with voice or wake
+   * debugging on). Absent means silent, and capture pages are not asked for
+   * reports.
+   */
+  readonly diagnostics?: VoiceDiagnostics | null;
+  /**
+   * Explicit microphone processing for every capture (development A/B only;
+   * `config.ts` never sets it in a packaged build). Null: browser defaults, all on.
+   */
+  readonly captureProcessing?: CaptureProcessing | null;
   readonly registry: ToolRegistry;
   readonly approvalTimeoutMs: number;
   readonly devConsoleEnabled: boolean;
@@ -104,6 +154,20 @@ export interface OrchestratorOptions {
   readonly captureCommand?: ((command: CaptureCommand) => void) | null;
   /** The microphone permission window, closed when the renderer reports. */
   readonly micGate?: MicGate | null;
+  /**
+   * What Axon has looked at, so a quit can forget it.
+   *
+   * A STRUCTURAL TYPE, not the store's own. The orchestrator has no business
+   * knowing how a visual observation is built or what is in one — it needs
+   * exactly one verb, and taking only that verb keeps the screen subsystem
+   * unreachable from here. `architecture.test.ts` asserts the absence of the
+   * import that a concrete type would have required.
+   *
+   * Cleared on shutdown for the same reason the browser is closed: a quit that
+   * leaves a picture of the user's screen in this process's memory is the same
+   * class of leak as one that leaves a Chromium running.
+   */
+  readonly observations?: { clear(): void } | null;
 }
 
 /** Shown when there is no persistence layer to ask. Matches its defaults. */
@@ -122,6 +186,32 @@ export class Orchestrator implements StateController {
   readonly bus: EventBus;
   readonly registry: ToolRegistry;
   readonly approvals: ApprovalBroker;
+  /** Forgotten on shutdown. See `OrchestratorOptions.observations`. */
+  private readonly observations: { clear(): void } | null;
+
+  /**
+   * What Axon is currently doing, and for whom.
+   *
+   * Owned HERE because cancellation is an orchestrator concern: stopping work
+   * means reaching an abort signal, a browser, a microphone and an observation
+   * store, and the ledger is the only thing that knows which work was being
+   * stopped. Everything else — the voice session, the bridge — reads it.
+   */
+  readonly tasks: TaskLedger;
+
+  /**
+   * The abort signal for work a spoken conversation started.
+   *
+   * A typed turn has had one since Step 7; a voice session did not, so
+   * "cancel" reached the model loop and the voice but never the executor
+   * already running. This closes that: every utterance mints one, and
+   * cancelling aborts it.
+   *
+   * Replaced rather than reused after a cancellation. An aborted signal stays
+   * aborted, so carrying it forward would make every subsequent action in the
+   * conversation fail as cancelled.
+   */
+  private voiceWork: AbortController | null = null;
   readonly dispatcher: Dispatcher;
 
   private readonly machine: AxonStateMachine;
@@ -150,10 +240,21 @@ export class Orchestrator implements StateController {
   private voiceCaptureId: string | null = null;
   /** True while the local wake word is listening. Display and audit only. */
   private wakeArmed = false;
+  /** Numeric audio-path diagnostics, or null. Never audio. */
+  private readonly diagnostics: VoiceDiagnostics | null;
+  private readonly captureProcessing: CaptureProcessing | null;
   /** The capture the wake word is listening on, or null when it is not. */
   private wakeCaptureId: string | null = null;
   /** Bound after construction: the detector is built after the orchestrator. */
   private wakeWord: WakeAudioSink | null = null;
+  /**
+   * The user said "stop listening": no microphone at all, not even the local
+   * wake word, until they explicitly start Axon again. See
+   * `endConversationByCommand`.
+   */
+  private micOff = false;
+  /** An explicit start during mic-off: re-arm the wake word when it ends. */
+  private rearmWakeAfterSession = false;
 
   /**
    * The persisted conversation this window is continuing.
@@ -188,6 +289,8 @@ export class Orchestrator implements StateController {
 
   constructor(options: OrchestratorOptions) {
     this.bus = options.bus;
+    this.diagnostics = options.diagnostics ?? null;
+    this.captureProcessing = options.captureProcessing ?? null;
     this.registry = options.registry;
     this.devConsoleEnabled = options.devConsoleEnabled;
     this.brain = options.brain ?? null;
@@ -201,6 +304,30 @@ export class Orchestrator implements StateController {
     this.speechChunks = options.speechChunks ?? null;
     this.captureCommand = options.captureCommand ?? null;
     this.micGate = options.micGate ?? null;
+    this.observations = options.observations ?? null;
+    // Traces go onto the SAME event stream everything else does, as
+    // observations carrying counters and ids. A second log would be a second
+    // account of what happened, and the point of the stream is that there is
+    // one.
+    this.tasks = new TaskLedger({
+      onTrace: (trace) => {
+        this.bus.emit({
+          type: 'OBSERVATION',
+          callId: null,
+          summary: `${trace.tool} ${trace.outcome.toLowerCase().replace(/_/g, ' ')}`,
+          detail: {
+            task: trace.taskId,
+            step: trace.stepId,
+            tool: trace.tool,
+            outcome: trace.outcome,
+            call: trace.callId,
+            risk: trace.risk,
+            approval: trace.approval,
+            verified: trace.verified,
+          },
+        });
+      },
+    });
 
     this.machine = new AxonStateMachine((change) => {
       this.bus.emit({
@@ -255,7 +382,7 @@ export class Orchestrator implements StateController {
    * is still reasoning about the result it just received. With a turn in
    * flight the resting state is THINKING; only outside one is it IDLE.
    */
-  settle(reason: string): void {
+  settle(reason: string, options?: { readonly listeningEnded?: boolean }): void {
     // LISTENING is not a resting state — it is a live session with an open
     // microphone, owned by the listening service. Settling out of it here
     // would take the UI out of LISTENING while the microphone was still on,
@@ -265,12 +392,63 @@ export class Orchestrator implements StateController {
     // This matters concretely during barge-in: interrupting speech resolves
     // the turn that was waiting on it, and that turn then settles a moment
     // after the machine has already entered LISTENING.
-    if (this.machine.state === 'LISTENING') return;
+    //
+    // `listeningEnded` is the one caller that knows better: the session that
+    // owned LISTENING has closed and its microphone with it. Without that
+    // exception a voice conversation ending by itself left the machine in
+    // LISTENING for ever — the panel sat on "Listening..." with no session
+    // behind it, and the orb never moved again. That is the same disagreement
+    // in the other direction, and it is the worse one: showing a microphone
+    // that is closed as open.
+    if (this.machine.state === 'LISTENING' && options?.listeningEnded !== true) return;
 
-    const target: AxonState = this.activeTurn ? 'THINKING' : 'IDLE';
+    // A LIVE CONVERSATION IS NOT IDLE BETWEEN STEPS.
+    //
+    // The dispatcher settles after every tool, and the resting state used to
+    // be chosen by `activeTurn` alone — a typed-turn concept that is null for
+    // the whole of a spoken conversation. So every voice tool call ended in
+    // IDLE, and a real multi-step request read:
+    //
+    //     12:50:10.450  CALL   browser.read
+    //     12:50:10.462  STATE  EXECUTING -> IDLE      "Done"
+    //     12:50:10.718  STATE  IDLE -> LISTENING
+    //
+    // three times in one YouTube search. IDLE is the dim, near-still orb, so
+    // the orb appeared to vanish in the middle of the work, which is also a
+    // false statement: Axon was not idle, it was about to act on the result.
+    //
+    // While a conversation is live the voice agent always receives the result
+    // and either replies or proposes the next step, so the honest resting
+    // state is THINKING — and the session's own phases (reply.started,
+    // tool.call, reply.done) move it on from there.
+    //
+    // SPEAKING is the session's to end, as LISTENING is. A slow tool can
+    // finish while Axon is still saying "Opening YouTube", and taking the orb
+    // out of SPEAKING then would contradict the audio the user is hearing.
+    const conversing = this.voiceConversationLive;
+    if (conversing && this.machine.state === 'SPEAKING') return;
+
+    const target: AxonState = this.activeTurn || conversing ? 'THINKING' : 'IDLE';
     if (this.machine.state !== target && this.machine.canTransition(target)) {
       this.machine.transition(target, reason);
     }
+  }
+
+  /**
+   * A spoken conversation is open and has not begun to close.
+   *
+   * `voicePhase` is written before the session reports CLOSED or FAILED, and
+   * `voiceSession` is cleared before the final settle in
+   * `onVoiceSessionClosed`, so a conversation that is ending is never treated
+   * as live — its last settle lands in IDLE, which is then true.
+   */
+  private get voiceConversationLive(): boolean {
+    return (
+      this.voiceSession !== null &&
+      this.voicePhase !== 'CLOSED' &&
+      this.voicePhase !== 'FAILED' &&
+      this.voicePhase !== 'IDLE'
+    );
   }
 
   fail(scope: string, message: string, detail: JsonValue | null = null): void {
@@ -670,6 +848,9 @@ export class Orchestrator implements StateController {
     // for a capture neither of them owns.
     this.endWakeCapture();
 
+    // Push-to-talk is an explicit start too, so it ends mic-off the same way.
+    if (trigger !== 'wake-word') this.resumeFromMicOff();
+
     const result = listening.start(trigger);
     if (!result.accepted) {
       // The session never opened, so nothing has to be unwound — but if the
@@ -679,9 +860,29 @@ export class Orchestrator implements StateController {
     return result;
   }
 
+  /**
+   * The window's account of playing the voice agent's reply. Numbers and
+   * fixed words, already validated by the bridge; printed only when a
+   * development build asked for voice diagnostics, otherwise dropped here.
+   */
+  reportPlaybackDiagnostics(report: PlaybackDiagnostics): void {
+    this.diagnostics?.playback(report);
+  }
+
   /** Stop listening. Anything already said is transcribed. */
   stopListening(): boolean {
     return this.listeningService?.stop() ?? false;
+  }
+
+  /**
+   * Numeric diagnostics from the capture page. Attributed by capture id, and
+   * dropped when nobody asked for them or the id is not a live capture.
+   */
+  reportCaptureDiagnostics(report: CaptureDiagnostics): void {
+    const diagnostics = this.diagnostics;
+    if (!diagnostics?.enabled) return;
+    if (report.captureId === this.voiceCaptureId) diagnostics.capture('voice', report);
+    else if (report.captureId === this.wakeCaptureId) diagnostics.capture('wake', report);
   }
 
   /**
@@ -704,13 +905,19 @@ export class Orchestrator implements StateController {
     // state. The Step 4 listening session is last, because it only exists
     // when there is no voice agent to use instead.
     if (this.voiceSession) {
-      if (captureId === this.voiceCaptureId) this.pushVoiceAudio(samples);
+      if (captureId === this.voiceCaptureId) {
+        this.diagnostics?.frame('voice', samples.length, VOICE_AGENT_LIMITS.sampleRate);
+        this.pushVoiceAudio(samples);
+      }
       return;
     }
     if (this.wakeCaptureId !== null) {
       // To a LOCAL recognizer, and nowhere else. This is the branch that makes
       // "before activation, audio stays on this machine" true.
-      if (captureId === this.wakeCaptureId) this.wakeWord?.pushFrame(samples);
+      if (captureId === this.wakeCaptureId) {
+        this.diagnostics?.frame('wake', samples.length, LISTENING_LIMITS.sampleRate);
+        this.wakeWord?.pushFrame(samples);
+      }
       return;
     }
     this.listeningService?.pushFrame(captureId, samples);
@@ -728,7 +935,31 @@ export class Orchestrator implements StateController {
     if (this.wakeCaptureId !== null || this.voiceSession) return;
     const captureId = randomUUID();
     this.wakeCaptureId = captureId;
-    this.captureCommand?.({ action: 'start', captureId, sampleRate: LISTENING_LIMITS.sampleRate });
+    this.captureCommand?.({
+      action: 'start',
+      captureId,
+      sampleRate: LISTENING_LIMITS.sampleRate,
+      diagnostics: this.diagnostics?.enabled === true,
+      ...(this.captureProcessing ? { processing: this.captureProcessing } : {}),
+    });
+  }
+
+  /**
+   * Give the wake word its microphone back after something borrowed it.
+   *
+   * A RELEASE-BLOCKING BUG, AND HOW IT HID. A voice session and a push-to-talk
+   * session both take the microphone from the wake word (`endWakeCapture`), and
+   * nothing gave it back. The detector stayed ARMED — the UI said Axon was
+   * listening for its name, the event stream said armed — while no audio
+   * reached it at all. So "Hey Axon" worked exactly once per launch: the first
+   * conversation ended, and Axon was deaf to its name from then on. Every
+   * wake-word test drove the detector directly, so none of them saw it.
+   *
+   * Only while armed, and only when nothing else owns the microphone.
+   */
+  private resumeWakeCapture(): void {
+    if (!this.wakeArmed || this.voiceSession || this.micOff) return;
+    this.beginWakeCapture();
   }
 
   /** Close the wake word's microphone. Reached from every disarm. */
@@ -784,6 +1015,10 @@ export class Orchestrator implements StateController {
    * beginning to think about it.
    */
   onListeningEnded(reason: ListeningEndReason): void {
+    // Push-to-talk borrowed the microphone from the wake word; give it back
+    // however the listening session ended.
+    this.resumeWakeCapture();
+    this.rearmIfResumed();
     if (reason === 'transcribed') return;
     if (this.machine.state === 'LISTENING') {
       this.machine.transition('IDLE', 'Stopped listening');
@@ -833,8 +1068,237 @@ export class Orchestrator implements StateController {
     this.fail('voice', message, null);
   }
 
+
+  /**
+   * Open the accounting a conversation STARTS with.
+   *
+   * This used to be the only budget a voice session ever got — "a voice
+   * session is one intention however many things are said inside it" — and
+   * that premise was wrong. A real session's event log:
+   *
+   *     12:56:55  app.open     BUDGET_EXCEEDED  "running for 444 seconds"
+   *     12:58:04  memory.save  BUDGET_EXCEEDED  "running for 513 seconds"
+   *     12:58:32  system.time  BUDGET_EXCEEDED  "running for 541 seconds"
+   *
+   * The five-minute ceiling is a bound on ONE REQUEST converging, and it was
+   * being charged against the whole conversation. After five minutes of
+   * talking every tool failed, including reading the clock, and the model
+   * told the user it had timed out.
+   *
+   * So each new request now opens its own accounting (`beginRequestAccounting`,
+   * from `onVoiceTranscript`). This one still runs at session start, because a
+   * provider can propose a tool before any transcript has arrived, and a call
+   * with no budget at all is unbounded — the one outcome worse than the bug.
+   *
+   * Public for the same reason `onVoiceTranscript` is: an integration test that
+   * opened its own would be testing its own idea of what a conversation costs.
+   * It grants nothing. A budget is a ceiling.
+   */
+  beginConversation(): void {
+    this.beginRequestAccounting(null);
+  }
+
+  /**
+   * Fresh accounting for one request: a new budget, a new duplicate ledger,
+   * and a new browser action count.
+   *
+   * REPLACED, NEVER CLEARED. `dispatcher.endTurn()` leaves dispatches
+   * unbudgeted, so ending the old accounting without opening new accounting
+   * would briefly remove every limit — a tool call landing in that gap would
+   * spend nothing. Opening the next budget in the same synchronous call is
+   * what makes the handover atomic.
+   *
+   * The limits themselves are untouched: 24 calls, five minutes and three
+   * identical attempts, now measured against the request they were written
+   * for.
+   */
+  private beginRequestAccounting(goal: string | null): void {
+    this.browser?.beginTurn();
+    this.dispatcher.beginTurn(new TurnBudget(), goal);
+  }
+
+  /**
+   * Something the user said, on its way into a task.
+   *
+   * PUBLIC because it is the whole conversational entry point, and a test that
+   * reconstructed it would be testing its own reconstruction. The voice
+   * session calls it with the provider's transcript; an integration test calls
+   * it with a sentence. Both take the same path, which is the point.
+   *
+   * It grants nothing. Everything it can do is: record what was said, decide
+   * whether that was an answer or a new request, move the goal, and install an
+   * abort signal. No tool becomes callable because of anything here.
+   */
+  onVoiceTranscript(text: string): void {
+    // Exactly what a typed message and a Step 4 transcript become. The
+    // spoken word gets no special standing anywhere downstream.
+    this.bus.emit({ type: 'USER_MESSAGE', text, source: 'voice' });
+
+    // --- "Go to sleep." / "Stop listening." -------------------------
+    // Before cancellation, and for the same reason: matched from the user's
+    // OWN WORDS, in main. A real session had the model answer "Goodnight!",
+    // "I will stop listening now" and "Stopped." while nothing stopped and
+    // the microphone kept streaming. See `matchesLifecycleCommand`.
+    const lifecycle = matchesLifecycleCommand(text);
+    if (lifecycle) {
+      this.endConversationByCommand(lifecycle);
+      return;
+    }
+
+    // --- "Stop." ---------------------------------------------------
+    // Matched against the USER'S OWN WORDS, before anything else happens
+    // with them. A model asked to decide whether it had been told to stop
+    // is the thing being stopped, and that is not a decision it should be
+    // making about itself.
+    if (matchesCancellation(text)) {
+      const stopped = this.cancelWork();
+      this.bus.emit({
+        type: 'OBSERVATION',
+        callId: null,
+        summary: stopped ? 'You asked Axon to stop, and it did' : 'Nothing was running to stop',
+        detail: null,
+      });
+      // No new task. A cancellation is not a request, and opening one for
+      // it would immediately give the model somewhere to keep working.
+      return;
+    }
+
+    // --- a new request ----------------------------------------------
+    // The goal moves with the conversation: a spoken session is one
+    // connection containing many requests, and each new thing the user
+    // says is the goal the next actions are judged against. Set from the
+    // TRANSCRIPT, never from the agent's paraphrase.
+    //
+    // A TRUST ASSUMPTION WORTH STATING, because it is the one place the
+    // goal boundary is not self-contained. This transcript is the
+    // PROVIDER'S transcription of the user's speech. Axon does not
+    // transcribe the streamed audio itself, so a provider that sent a
+    // fabricated `transcript.user` could set a goal the user never spoke —
+    // and the goal boundary would then judge navigations against it.
+    //
+    // Three things bound what that could achieve, none of which make it
+    // acceptable to forget. The goal only ever WIDENS what needs asking
+    // about: a fabricated goal cannot make an action skip the risk policy,
+    // the approval gate, the duplicate guard or the budget, because the
+    // boundary can only escalate and never de-escalate below the tool's
+    // own verdict. It cannot name a tool, a path or a URL. And the user is
+    // watching a real window with a real dialog. What it could do is stop
+    // Axon asking about a consequential navigation it would otherwise have
+    // asked about, which is a real reduction in a defence in depth.
+    //
+    // Fixing it properly needs a local transcription of the same audio to
+    // compare against, which is a milestone of its own rather than a line
+    // here. It is recorded in the README's known limitations.
+    // ANSWER, OR NEW REQUEST? The ledger decides, from whether Axon had
+    // asked a question. An answer CONTINUES the task that asked it —
+    // keeping its id, its steps and its original goal — because "the
+    // second one" superseding the request it was answering would discard
+    // the very context it needs to mean anything.
+    const received = this.tasks.receive(text, 'voice');
+
+    // The boundary judges against the ORIGINAL request plus the most
+    // recent thing said inside the task. See `TaskLedger.effectiveGoal`
+    // for why that pair rather than an accumulating transcript.
+    this.dispatcher.setTurnGoal(this.tasks.effectiveGoal ?? text);
+
+    if (received.continued) {
+      // Same task, same work, same abort signal. Replacing the signal here
+      // would abandon an executor the user is still waiting on.
+      this.bus.emit({
+        type: 'OBSERVATION',
+        callId: null,
+        summary: 'You answered Axon, and it carried on with the same request',
+        detail: { task: received.taskId },
+      });
+      return;
+    }
+
+    // A NEW request, so new accounting: its own budget, its own duplicate
+    // ledger, its own browser action count. An answer to Axon's question took
+    // the `continued` branch above and keeps the task's accounting, because it
+    // is the same request. See `beginConversation` for the log that made this
+    // necessary. Opened with the goal, since `beginTurn` sets it.
+    this.beginRequestAccounting(this.tasks.effectiveGoal ?? text);
+
+    // A fresh abort signal per request, so "stop" reaches an executor
+    // that is already running. Replaced rather than reused: an aborted
+    // signal stays aborted.
+    this.voiceWork = new AbortController();
+    this.dispatcher.setTurnSignal(this.voiceWork.signal);
+  }
+
+  /**
+   * Stop the work in flight WITHOUT ending the conversation.
+   *
+   * The difference from `cancelTurn` is the whole reason this exists. A user
+   * who says "stop" is still talking to Axon: closing the socket would drop
+   * the microphone, end the session, and make the next thing they say go
+   * nowhere. What they want stopped is the WORK.
+   *
+   * Everything a cancellation has to reach, in the order it has to be reached:
+   *
+   *   the ledger      so a result already in flight is recognised as unwanted
+   *                   and cannot speak or prompt the next step
+   *   the executors   so a tool actually running is aborted rather than
+   *                   allowed to finish into a task nobody wants
+   *   the browser     so a navigation in flight is abandoned
+   *   the observations so a target reference minted for the cancelled work
+   *                   cannot be acted on afterwards
+   *   the accounting  so the next request starts with a fresh budget and a
+   *                   fresh duplicate ledger
+   *
+   * Returns false when there was nothing to stop, which is the difference
+   * between "Stopped." and saying nothing.
+   */
+  cancelWork(reason = 'Stopped'): boolean {
+    const cancelled = this.tasks.cancelActive();
+
+    // The abort signal first: it is what stops an executor that is running
+    // right now, and everything below it is cleanup.
+    const work = this.voiceWork;
+    this.voiceWork = null;
+    work?.abort();
+    this.dispatcher.setTurnSignal(null);
+
+    // A dialog still on screen for work the user has just abandoned is worse
+    // than useless: answering it would authorise an act nobody wants any more,
+    // and leaving it up asks them to decide about something that is over.
+    // Recorded as a USER denial, because it is one — they said stop.
+    this.approvals.denyAll('user');
+
+    // A cancelled request that is still loading a page is not cancelled.
+    this.browser?.cancel();
+    // A reference minted for work the user stopped must not survive it. The
+    // store expires on its own clock; this is the user saying so sooner.
+    this.observations?.clear();
+
+    // Fresh accounting for whatever they ask for next. A cancelled request
+    // must not leave its budget or its side-effect ledger attached to the
+    // next one.
+    this.dispatcher.endTurn();
+    this.browser?.beginTurn();
+    this.dispatcher.beginTurn(new TurnBudget());
+
+    if (cancelled) {
+      this.bus.emit({
+        type: 'OBSERVATION',
+        callId: null,
+        // `status` without a `step` is how the timeline learns a task ENDED
+        // rather than that a step happened inside it.
+        detail: { task: cancelled, status: 'CANCELLED' },
+        summary: reason,
+      });
+    }
+    return cancelled !== null;
+  }
+
   /** Stop the turn in flight, if any. Returns false when there was none. */
   cancelTurn(reason = 'Cancelled'): boolean {
+    // The ledger and the observations are cancelled here too. A typed
+    // cancellation stops the same work a spoken one does; what it also does,
+    // below, is end the conversation.
+    this.tasks.cancelActive();
+    this.observations?.clear();
     // Stop the voice too: a cancelled turn that keeps talking is not cancelled.
     this.speech?.cancel('cancelled');
     // And the microphone: a cancelled turn that is still recording is worse.
@@ -901,33 +1365,46 @@ export class Orchestrator implements StateController {
     // and "which one is receiving this?" must never be ambiguous.
     this.endWakeCapture();
 
-    // A fresh spend for the conversation. A voice session is one intention
-    // however many things are said inside it, so it gets one budget and one
-    // duplicate ledger — the same treatment a typed turn gets.
-    this.browser?.beginTurn();
-    this.dispatcher.beginTurn(new TurnBudget());
+    // An explicit start is how the user turns the microphone back on after
+    // "stop listening". The wake word cannot have started this one: it was
+    // not listening.
+    if (activation !== 'wake-word') this.resumeFromMicOff();
+
+    // A fresh spend for the conversation. See `beginConversation`.
+    this.beginConversation();
+
+    // What the user has approved Axon to remember, recalled ONCE for the
+    // session. The same bounded, memory-setting-aware slice the typed brain
+    // is given (`contextForTurn`), of which the voice agent takes only the
+    // memories: it holds its own conversation, and a transcript of earlier
+    // typed turns would be context it did not have and cannot attribute.
+    // Read-only: nothing here writes, and ordinary conversation is never
+    // saved — only an explicit, approved `memory.save` does that.
+    const memories = this.persistence?.contextForTurn().context?.memories ?? [];
 
     const session = provider.create({
       tools: this.listTools(),
+      memories,
       dispatch: (call) => this.dispatcher.dispatch(call),
       // Read-only. The real gate is still the dispatcher's; this only decides
       // whether the agent is told "pending" now or made to wait.
       willRequireApproval: (tool, input) => this.dispatcher.requiresApproval(tool, input),
+      // Also read-only, and the same object the dialog will render from.
+      describeApproval: (tool, input) => this.dispatcher.describeApproval(tool, input),
+      // Read-only from the session's side. Cancellation writes to it here.
+      tasks: this.tasks,
       onUserTranscript: (text) => {
-        // The goal moves with the conversation: a spoken session is one turn
-        // containing many requests, and each new thing the user says is the
-        // goal the next actions are judged against. Set from the TRANSCRIPT,
-        // which is what the user said — never from the agent's paraphrase.
-        this.dispatcher.setTurnGoal(text);
-        // Exactly what a typed message and a Step 4 transcript become. The
-        // spoken word gets no special standing anywhere downstream.
-        this.bus.emit({ type: 'USER_MESSAGE', text, source: 'voice' });
+        this.diagnostics?.transcript('final', text);
+        this.onVoiceTranscript(text);
       },
       onAgentTranscript: (text) => {
         this.bus.emit({ type: 'ASSISTANT_MESSAGE', text });
       },
       onAudioChunk: (chunk) => {
-        this.speechChunks?.chunk(chunk);
+        const delivered = this.speechChunks?.chunk(chunk) ?? false;
+        // Counted per reply: was there a live window to take it? The final
+        // chunk is an empty drain marker, not audio, so it is not counted.
+        if (!chunk.final) this.diagnostics?.replyDelivered(chunk.speechId, delivered);
       },
       onPhase: (phase, detail) => {
         this.onVoicePhase(phase, detail);
@@ -938,6 +1415,20 @@ export class Orchestrator implements StateController {
       onClosed: (error) => {
         this.onVoiceSessionClosed(error ? error.message : null);
       },
+      // Diagnostics only, and only wired when someone is listening, so the
+      // session does no extra work in the shipping build.
+      ...(this.diagnostics?.enabled
+        ? {
+            onAudioSent: (bytes: number, buffered: number) => this.diagnostics?.audioSent(bytes, buffered),
+            onAudioDropped: (bytes: number, reason: 'not-ready' | 'no-socket') =>
+              this.diagnostics?.audioDropped(bytes, reason),
+            onUserTranscriptDelta: (text: string) => this.diagnostics?.transcript('partial', text),
+            // The other direction: what the provider sent back, and what
+            // became of it. See `reply-audio.ts`.
+            onReplyAudio: (event: ReplyAudioNote) => this.diagnostics?.replyAudio(event),
+            onReplySummary: (summary: ReplyNote) => this.diagnostics?.replySummary(summary),
+          }
+        : {}),
     });
 
     this.voiceSession = session;
@@ -979,6 +1470,83 @@ export class Orchestrator implements StateController {
     return { accepted: true, error: null };
   }
 
+  /**
+   * The user ended the conversation in words. Act first; say nothing false.
+   *
+   * TWO STATES, NOT ONE, because they are different promises:
+   *
+   *   sleep    the conversation ends and the microphone stops streaming now.
+   *            The LOCAL wake word keeps listening — no audio leaves the
+   *            machine until "Hey Axon" — and the panel says "On-device".
+   *   mic-off  the same, and the wake word stops too. Nothing is listened to,
+   *            even locally, until the user explicitly starts Axon again (the
+   *            orb, the hotkey, the tray). The panel says "Mic off".
+   *
+   * ORDER MATTERS. The wake word is switched off BEFORE the session closes,
+   * because closing a session hands the microphone back to the wake word
+   * (`resumeWakeCapture`) — and for mic-off there must be no instant in which
+   * it is reopened. `session.stop()` is synchronous, so by the time this
+   * returns the socket is closed, the capture is ended and the machine has
+   * settled to IDLE.
+   *
+   * No spoken farewell. The provider's voice is gone once the socket closes,
+   * and closing it later to let Axon say goodbye would keep streaming a
+   * microphone the user has just asked to stop. What the user gets instead
+   * is the truth, immediately: the orb leaves, and the panel's microphone
+   * chip changes.
+   */
+  private endConversationByCommand(command: LifecycleCommand): void {
+    // Someone ending the conversation is not asking Axon to finish its work.
+    this.cancelWork('Stopped');
+
+    if (command === 'mic-off') {
+      this.micOff = true;
+      this.rearmWakeAfterSession = false;
+      this.wakeWord?.disarm?.();
+      // The real detector reports this itself; recorded here too so the
+      // panel's "Mic off" is true even for one that does not. Idempotent.
+      this.setWakeArmed(false);
+    }
+
+    this.voiceSession?.stop();
+
+    const summary =
+      command === 'mic-off'
+        ? 'Microphone off. Axon is not listening at all — not even for "Hey Axon" — until you start it again.'
+        : this.wakeArmed
+          ? 'Axon went to sleep. The conversation has ended; say "Hey Axon" when you need it.'
+          : 'The conversation has ended. Use the hotkey or the orb when you need Axon again.';
+    this.bus.emit({ type: 'OBSERVATION', callId: null, summary, detail: { lifecycle: command } });
+  }
+
+  /**
+   * An explicit start ends mic-off.
+   *
+   * Only an explicit one — the orb, the hotkey, the tray — can reach here
+   * while the microphone is off, because the wake word is not listening. From
+   * that start, normal behaviour resumes: the wake word is re-armed when this
+   * conversation ends, exactly as it would have been before "stop listening".
+   */
+  private resumeFromMicOff(): void {
+    if (!this.micOff) return;
+    this.micOff = false;
+    this.rearmWakeAfterSession = true;
+  }
+
+  /** Bring the wake word back after an explicit start ended mic-off. */
+  private rearmIfResumed(): void {
+    if (!this.rearmWakeAfterSession || this.micOff) return;
+    this.rearmWakeAfterSession = false;
+    // `arm` reports its own failures through its notice channel; a wake word
+    // that cannot start again leaves Axon reachable by the hotkey and the orb.
+    void this.wakeWord?.arm?.().catch(() => {});
+  }
+
+  /** True while the user has turned the microphone off. For the snapshot. */
+  get microphoneOff(): boolean {
+    return this.micOff;
+  }
+
   /** End the spoken conversation. Returns false when there was none. */
   stopVoiceSession(): VoiceSessionResult {
     const session = this.voiceSession;
@@ -996,6 +1564,7 @@ export class Orchestrator implements StateController {
       active: this.voiceSession !== null,
       phase: this.voicePhase,
       armed: this.wakeArmed,
+      wake: this.wakeWord?.getStatus() ?? NO_WAKE_DETECTOR,
     };
   }
 
@@ -1013,6 +1582,13 @@ export class Orchestrator implements StateController {
 
   /** The wake word started or stopped listening, locally. */
   setWakeArmed(armed: boolean): void {
+    // Mic-off holds against anything that re-arms the detector behind the
+    // user's back — a renderer reload re-arms it on `did-finish-load`, and
+    // that must not quietly reopen a microphone the user asked to close.
+    if (armed && this.micOff) {
+      this.wakeWord?.disarm?.();
+      return;
+    }
     if (this.wakeArmed === armed) return;
     this.wakeArmed = armed;
     // The microphone follows the wake word's state, in both directions. A
@@ -1102,6 +1678,11 @@ export class Orchestrator implements StateController {
     // prevent.
     this.endVoiceCapture(this.voiceCaptureId);
     this.dispatcher.endTurn();
+    // And the wake word gets its microphone back. See `resumeWakeCapture`.
+    this.resumeWakeCapture();
+    // Or, after mic-off and one explicit conversation, the wake word itself
+    // comes back on. See `resumeFromMicOff`.
+    this.rearmIfResumed();
 
     this.bus.emit({
       type: 'VOICE_SESSION',
@@ -1111,8 +1692,10 @@ export class Orchestrator implements StateController {
       detail: error ?? 'Voice conversation ended',
     });
 
+    // `listeningEnded`: the microphone closed a few lines above, so LISTENING
+    // is no longer true and the machine must leave it. See `settle`.
     if (error) this.fail('voice', error, null);
-    else this.settle('Voice conversation ended');
+    else this.settle('Voice conversation ended', { listeningEnded: true });
   }
 
   /** Ask the renderer for the microphone, at the agent's sample rate. */
@@ -1122,7 +1705,13 @@ export class Orchestrator implements StateController {
     // Through `captureCommand`, which is the transport — so the permission
     // window opens on the command, exactly as it does for a listening session.
     // There is no second route to a microphone here.
-    this.captureCommand?.({ action: 'start', captureId, sampleRate: VOICE_AGENT_LIMITS.sampleRate });
+    this.captureCommand?.({
+      action: 'start',
+      captureId,
+      sampleRate: VOICE_AGENT_LIMITS.sampleRate,
+      diagnostics: this.diagnostics?.enabled === true,
+      ...(this.captureProcessing ? { processing: this.captureProcessing } : {}),
+    });
     return captureId;
   }
 
@@ -1146,12 +1735,18 @@ export class Orchestrator implements StateController {
     // And closes the browser window: an orphaned Chromium outliving Axon is
     // exactly the resource leak this milestone must not introduce.
     this.browser?.close();
+    // And forgets what Axon has looked at. The store expires on its own clock,
+    // but "it will be gone in a minute" is a weaker promise than "it is gone",
+    // and a screen capture is the most personal thing Axon holds.
+    this.observations?.clear();
     // Stop the voice and release any turn waiting on it, so a quit during
     // speech cannot leave a promise pending forever.
     this.speech?.shutdown();
     const resolve = this.speechFinished;
     this.speechFinished = null;
     resolve?.();
+    // And forgets what Axon was doing. A quit is the end of every task.
+    this.tasks.clear();
     this.dispatcher.abortAll();
   }
 }

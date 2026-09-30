@@ -1296,11 +1296,35 @@ describe('BOUNDARY: desktop control', () => {
   });
 
   it('exposes no process control anywhere in the desktop path', () => {
-    // Enumerate and move a window. Not start, stop, inspect or read one.
+    // Enumerate and move a window. Not start, stop, or read into one.
+    //
+    // PHASE 4A narrowed "inspect" to exactly one question: WHO OWNS THIS
+    // WINDOW. Answering it needs the owning process's image name and package
+    // identity, which needs one `OpenProcess` — so it is allowed once, with
+    // PROCESS_QUERY_LIMITED_INFORMATION (0x1000) and nothing else: the right
+    // that cannot read memory, cannot write, cannot terminate and cannot read
+    // a command line. Everything that could is still forbidden outright, and
+    // command lines are added to the list.
     const source = fs.readFileSync(desktopPort!.abs, 'utf8');
-    for (const forbidden of ['TerminateProcess', 'Stop-Process', 'OpenProcess', 'ReadProcessMemory', 'DestroyWindow', 'CloseWindow']) {
+    for (const forbidden of [
+      'TerminateProcess',
+      'Stop-Process',
+      'ReadProcessMemory',
+      'WriteProcessMemory',
+      'CreateRemoteThread',
+      'VirtualAllocEx',
+      'DebugActiveProcess',
+      'NtQueryInformationProcess',
+      'Win32_Process',
+      'CommandLine',
+      'Get-Process',
+      'DestroyWindow',
+      'CloseWindow',
+    ]) {
       expect(source, `the desktop port must not use ${forbidden}`).not.toContain(forbidden);
     }
+    const opens = [...source.matchAll(/OpenProcess\(([^)]*)\)/g)].filter((match) => !/uint access/.test(match[1] ?? ''));
+    expect(opens.map((match) => match[1]), 'exactly one OpenProcess call, query-limited only').toEqual(['0x1000, false, pid']);
   });
 
   it('never lets a raw window handle reach the model', () => {
@@ -1370,5 +1394,699 @@ describe('BOUNDARY: desktop control', () => {
         expect(source, `${file.rel} must not inject input`).not.toContain(forbidden);
       }
     }
+  });
+});
+
+/**
+ * Phase 2's boundaries: seeing the screen, and acting on what was seen.
+ *
+ * The new capabilities are the largest Axon has taken on since the browser —
+ * one of them makes other people's applications do things — so each of the
+ * properties they rest on is asserted about the SOURCE TREE rather than about
+ * a runtime path somebody could route around.
+ */
+describe('BOUNDARY: the screen subsystem', () => {
+  const screenFiles = filesUnder(DESKTOP_FILES, 'apps/desktop/src/main/screen/');
+  const isScreenImport = (specifier: string): boolean => /(^|\/)screen\//.test(specifier);
+
+  it('exists, so these rules are not vacuous', () => {
+    expect(screenFiles.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('is unreachable from the renderer and the preload bridge', () => {
+    for (const surface of ['apps/desktop/src/renderer/', 'apps/desktop/src/preload/']) {
+      for (const file of filesUnder(DESKTOP_FILES, surface)) {
+        expect(
+          importsMatching(file, (specifier) => isScreenImport(specifier) || /ui-input|system-time/.test(specifier)),
+          `${file.rel} must not reach the screen subsystem`,
+        ).toEqual([]);
+      }
+    }
+  });
+
+  it('is not reachable from the voice agent, which only proposes', () => {
+    for (const file of filesUnder(DESKTOP_FILES, 'apps/desktop/src/main/agent/')) {
+      expect(
+        importsMatching(file, (specifier) => isScreenImport(specifier) || isExecutorImport(specifier)),
+        `${file.rel} must not reach the screen subsystem or an executor`,
+      ).toEqual([]);
+    }
+  });
+
+  it('is not reachable from the orchestrator, which only forgets it', () => {
+    // The orchestrator clears the store on shutdown, and that is the ONLY
+    // thing it knows about it — it takes a structural `{ clear(): void }`
+    // rather than the store's own type, so it cannot learn what an
+    // observation is, what is in one, or how to mint a reference.
+    for (const file of filesUnder(DESKTOP_FILES, 'apps/desktop/src/main/orchestrator/')) {
+      expect(
+        importsMatching(file, isScreenImport),
+        `${file.rel} must not reach the screen subsystem`,
+      ).toEqual([]);
+    }
+    const source = fs.readFileSync(
+      DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/orchestrator/orchestrator.ts')!.abs,
+      'utf8',
+    );
+    expect(source).toMatch(/observations\?:\s*\{\s*clear\(\): void\s*\}/);
+    expect(source).toMatch(/this\.observations\?\.clear\(\)/);
+  });
+
+  it('never imports an executor, the registry, the safety layer or the model SDK', () => {
+    const forbidden = (s: string): boolean =>
+      isExecutorImport(s) ||
+      /(^|\/)tools\/registry(\.js)?$/.test(s) ||
+      /(^|\/)safety\//.test(s) ||
+      s.startsWith(VENDOR_SDK);
+    const offenders = screenFiles
+      .filter((file) => importsMatching(file, forbidden).length > 0)
+      .map((file) => `${file.rel} -> ${importsMatching(file, forbidden).join(', ')}`);
+    expect(offenders).toEqual([]);
+  });
+
+  it('spawns no process, touches no filesystem and reaches no network', () => {
+    // The store holds a picture of the user's screen. It must not be able to
+    // write one anywhere, or send one anywhere. Capturing and saving are the
+    // tool's job, under the dispatcher; deciding what may be acted on is this
+    // subsystem's, and the two capabilities stay apart.
+    for (const file of screenFiles) {
+      expect(
+        importsMatching(file, (s) => /^(node:)?(child_process|fs(\/promises)?|https?|net)$/.test(s)),
+        `${file.rel} must not reach the filesystem, a process or the network`,
+      ).toEqual([]);
+      const source = fs.readFileSync(file.abs, 'utf8');
+      expect(source, `${file.rel} must not reach the network`).not.toMatch(/fetch\(|WebSocket/);
+    }
+  });
+
+  it('never lets an OS handle, an automation id or a coordinate reach the model', () => {
+    // The projection is the boundary. `ScreenTargetIdentity` — the handle and
+    // the automation id — is what the main process uses to find a control
+    // again, and a model that received it could name a control Axon has not
+    // looked at.
+    const store = screenFiles.find((file) => file.rel.endsWith('screen/visual-observation.ts'));
+    expect(store).toBeDefined();
+
+    const source = fs.readFileSync(store!.abs, 'utf8');
+    const projection = source.slice(source.indexOf('export function toObservationOutput'));
+    for (const forbidden of ['windowHandle', 'automationId', 'nativeRole', 'png']) {
+      expect(projection, `the projection must not carry ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it('constrains a target reference at the schema', () => {
+    const tools = fs.readFileSync(
+      DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/tools/executors/ui-input.ts')!.abs,
+      'utf8',
+    );
+    expect(tools).toMatch(/\.regex\(\/\^t\\d\{1,6\}\$\//);
+  });
+
+  it('accepts no coordinate, selector, handle or script anywhere in the input tools', () => {
+    const tools = fs.readFileSync(
+      DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/tools/executors/ui-input.ts')!.abs,
+      'utf8',
+    );
+    const code = tools.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+    for (const forbidden of ['coordinate', 'selector', 'eval(', 'new Function']) {
+      expect(code, `ui-input must not accept a ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it('still adds no synthetic input, anywhere in the tree', () => {
+    // Phase 2 added clicking and typing WITHOUT adding input injection, which
+    // is the whole reason those tools could be built at all. Coordinate and
+    // keystroke injection act on whatever is under the pointer or holds focus
+    // at delivery; UI Automation acts on an element. This rule is what keeps
+    // the first from arriving quietly as an optimisation of the second.
+    for (const file of DESKTOP_FILES) {
+      const source = fs.readFileSync(file.abs, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+      for (const forbidden of ['SendKeys', 'keybd_event', 'SetCursorPos', 'mouse_event', 'SendInput']) {
+        expect(source, `${file.rel} must not inject input`).not.toContain(forbidden);
+      }
+    }
+  });
+});
+
+describe('BOUNDARY: every Phase 2 tool goes through the one door', () => {
+  const registryFile = DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/tools/registry.ts')!;
+  const NEW_EXECUTORS = ['executors/system-time', 'executors/ui-input'];
+
+  it('registers each of them in the registry, and only there', () => {
+    for (const executor of NEW_EXECUTORS) {
+      const pattern = new RegExp(executor.replace('/', '\\/'));
+      expect(importsMatching(registryFile, (s) => pattern.test(s)).length, executor).toBe(1);
+
+      for (const file of DESKTOP_FILES) {
+        if (file.rel === registryFile.rel) continue;
+        expect(
+          importsMatching(file, (s) => pattern.test(s)),
+          `${file.rel} must not import ${executor} directly`,
+        ).toEqual([]);
+      }
+    }
+  });
+
+  it('gives each of them the same gates every other tool has', () => {
+    // A tool is a `defineTool` with a schema, a risk resolution and a summary.
+    // Anything that skipped one of those would be a tool the dispatcher could
+    // not gate, and the dispatcher is the only door.
+    for (const rel of [
+      'apps/desktop/src/main/tools/executors/system-time.ts',
+      'apps/desktop/src/main/tools/executors/ui-input.ts',
+      'apps/desktop/src/main/tools/executors/system-screenshot.ts',
+    ]) {
+      const source = fs.readFileSync(DESKTOP_FILES.find((file) => file.rel === rel)!.abs, 'utf8');
+      expect(source, `${rel} must define tools the audited way`).toMatch(/defineTool</);
+      expect(source, `${rel} must declare a schema`).toMatch(/inputSchema/);
+      expect(source, `${rel} must resolve risk`).toMatch(/resolveRisk/);
+      expect(source, `${rel} must describe itself to a human`).toMatch(/summarize/);
+    }
+  });
+
+  it('leaves the registry held by the same three modules as before', () => {
+    // Restated for the new tools: nothing outside these may hold the registry,
+    // so there is no second path from a proposal to an executor.
+    const holders = DESKTOP_FILES.filter(
+      (file) =>
+        file.rel !== 'apps/desktop/src/main/tools/registry.ts' &&
+        importsMatching(file, (s) => /(^|\/)tools\/registry(\.js)?$/.test(s)).length > 0,
+    )
+      .map((file) => file.rel)
+      .sort();
+
+    expect(holders).toEqual([
+      'apps/desktop/src/main/orchestrator/orchestrator.ts',
+      'apps/desktop/src/main/runtime.ts',
+      'apps/desktop/src/main/safety/dispatcher.ts',
+    ]);
+  });
+});
+
+describe('SECURITY: there is no arbitrary command execution', () => {
+  const mainFiles = filesUnder(DESKTOP_FILES, 'apps/desktop/src/main/');
+
+  it('spawns a process from exactly five modules, every one a named provider', () => {
+    // Two speech providers, one keyword spotter, one application launcher, one
+    // desktop port. The list is exhaustive and it is an equality check, so a
+    // sixth spawner is a failing test rather than a code review somebody might
+    // miss. `keyword-engine.ts` joined it when the wake word moved to a
+    // dedicated local spotter: that model runs in a child process ON PURPOSE,
+    // so that a native fault cannot take Axon down and so that the process
+    // listening all day holds neither API key. See its header, and the
+    // per-file import allowlist in the wake boundary block below.
+    const spawners = mainFiles
+      .filter((file) => importsMatching(file, (s) => /^(node:)?child_process$/.test(s)).length > 0)
+      .map((file) => file.rel)
+      .sort();
+
+    expect(spawners).toEqual([
+      'apps/desktop/src/main/platform/electron-platform.ts',
+      'apps/desktop/src/main/platform/windows-desktop.ts',
+      'apps/desktop/src/main/voice/sapi-tts.ts',
+      'apps/desktop/src/main/voice/windows-stt.ts',
+      'apps/desktop/src/main/wake/keyword-engine.ts',
+    ]);
+  });
+
+  it('never spawns with a shell, and never evaluates a command string', () => {
+    for (const file of mainFiles) {
+      const source = fs
+        .readFileSync(file.abs, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+      expect(source, `${file.rel} must not spawn a shell`).not.toMatch(/shell\s*:\s*true/);
+      expect(source, `${file.rel} must not exec a command string`).not.toMatch(/\bexecSync\b|\bexecFileSync\b/);
+      expect(source, `${file.rel} must not evaluate PowerShell`).not.toMatch(/Invoke-Expression|\biex\b/);
+    }
+  });
+
+  it('exposes no tool that takes a command, a path to an executable, or a script', () => {
+    // The whole executor surface, checked as one. `app.open` takes a key from
+    // an enumerated table; nothing anywhere takes something to run.
+    for (const file of filesUnder(DESKTOP_FILES, 'apps/desktop/src/main/tools/executors/')) {
+      // Comments stripped first. `app-registry.ts` explains in prose why a
+      // shell string is not a permitted application, and a rule that matched
+      // its own explanation would fail for the best possible reason and still
+      // be useless.
+      const source = fs
+        .readFileSync(file.abs, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/(^|[^:])\/\/.*$/gm, '$1')
+        .toLowerCase();
+      for (const forbidden of ['child_process', 'spawn(', 'powershell', 'cmd.exe', '.bat', '.ps1']) {
+        expect(source, `${file.rel} must not name ${forbidden}`).not.toContain(forbidden);
+      }
+    }
+  });
+
+  // Every program in the desktop port, wherever it is defined. Phase 4B moved
+  // the accessibility program to its own module (`uia-program.ts`) when it
+  // became a native engine; the rules follow it there.
+  const PROGRAM_FILES = ['apps/desktop/src/main/platform/windows-desktop.ts', 'apps/desktop/src/main/platform/uia-program.ts'];
+  const programsIn = (): { name: string; body: string }[] =>
+    PROGRAM_FILES.flatMap((rel) => {
+      const source = fs.readFileSync(DESKTOP_FILES.find((file) => file.rel === rel)!.abs, 'utf8');
+      return [...source.matchAll(/(?:export )?const ([A-Z_]*SCRIPT) = String\.raw`([\s\S]*?)`;/g)].map((match) => ({
+        name: match[1] ?? '',
+        body: match[2] ?? '',
+      }));
+    });
+
+  it('builds every PowerShell program from a module constant', () => {
+    // A window title and a control name are written by other applications,
+    // and a program assembled around one would be code execution by any
+    // application that can name its own window.
+    //
+    // THREE: the window program, application discovery, and — since Phase 4B
+    // — the native accessibility engine, which REPLACED the managed one (it
+    // did not join it). The count is pinned rather than loosened to "at least
+    // one", so a fourth program is still a deliberate edit to this line.
+    const programs = programsIn();
+    expect(programs.map((program) => program.name).sort(), 'every program must be a module constant').toEqual([
+      'APPS_SCRIPT',
+      'SCRIPT',
+      'UIA_HOST_SCRIPT',
+    ]);
+    for (const { name, body } of programs) {
+      expect(body, `${name}: nothing may be interpolated into a program`).not.toMatch(/\$\{/);
+      expect(body, `${name}: no program may evaluate a string`).not.toMatch(/Invoke-Expression|\biex\b|Start-Process|Invoke-Item/i);
+    }
+
+    // Values arrive out of band: the window and discovery programs read the
+    // environment; the engine reads JSON lines on its own stdin.
+    const desktop = fs.readFileSync(DESKTOP_FILES.find((file) => file.rel === PROGRAM_FILES[0])!.abs, 'utf8');
+    expect(desktop).toMatch(/\$env:AXON_WINDOW_MODE/);
+    expect(desktop).toMatch(/\$env:AXON_APPS_MODE/);
+    const engine = programs.find((program) => program.name === 'UIA_HOST_SCRIPT')!.body;
+    expect(engine).toMatch(/Console\.In\.ReadLine\(\)/);
+  });
+
+  it('makes every program write UTF-8, which is how its output is read', () => {
+    // Measured in Phase 3: without this, Windows PowerShell writes redirected
+    // output in the OEM code page, a "•" in a Spotify control name arrived as a
+    // raw 0x07, and the whole reading failed to parse.
+    const programs = programsIn();
+    expect(programs).toHaveLength(3);
+    for (const { name, body } of programs) {
+      const lines = body.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '');
+      expect(lines[1], name).toBe('[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false');
+    }
+    // The engine also READS text — on its way into a field — so its input is UTF-8 too.
+    const engine = programs.find((program) => program.name === 'UIA_HOST_SCRIPT')!.body;
+    expect(engine).toMatch(/\[Console\]::InputEncoding = New-Object System\.Text\.UTF8Encoding \$false/);
+    const desktop = fs.readFileSync(DESKTOP_FILES.find((file) => file.rel === PROGRAM_FILES[0])!.abs, 'utf8');
+    expect(desktop).toMatch(/child\.stdout\.setEncoding\('utf8'\)/);
+  });
+
+  it('keeps the accessibility request as data, never as a statement', () => {
+    // Built with JSON.stringify on this side and parsed by a JSON PARSER on
+    // the other — `JavaScriptSerializer.Deserialize` into a dictionary whose
+    // every key and value the engine then validates. A parser, not an
+    // evaluator: no request field is code, a path, a type name or a command.
+    const host = fs.readFileSync(DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/platform/uia-host.ts')!.abs, 'utf8');
+    expect(host).toMatch(/JSON\.stringify\(\{ id, \.\.\.request \}\)/);
+    const engine = programsIn().find((program) => program.name === 'UIA_HOST_SCRIPT')!.body;
+    expect(engine).toMatch(/json\.Deserialize<Dictionary<string, object>>\(line\)/);
+    // Unknown keys and unknown operations are refused, never ignored into meaning.
+    expect(engine).toMatch(/return Fail\(id, "invalid"\)/);
+    expect(engine).toMatch(/return Fail\(id, "unknown-op"\)/);
+  });
+
+  it('gives the native engine exactly one COM class, and no way to load, start or reach anything else', () => {
+    const engine = programsIn().find((program) => program.name === 'UIA_HOST_SCRIPT')!.body;
+    // The ONE class it creates: CUIAutomation, by its constant CLSID.
+    expect([...engine.matchAll(/GetTypeFromCLSID\(/g)]).toHaveLength(1);
+    expect(engine).toMatch(/const string CUIAutomation = "ff48dba4-60ef-4201-aa87-54103eef594e";/);
+    expect(engine).not.toMatch(/GetTypeFromProgID|Type\.GetType\(|Assembly\.Load|LoadLibrary|LoadFrom|Activator\.CreateInstance\((?!Type\.GetTypeFromCLSID\(new Guid\(CUIAutomation\)\))/);
+    // No process, no file, no network, no registry, no reflection-driven invocation.
+    expect(engine).not.toMatch(/Process\.Start|System\.IO\.File|System\.Net|Registry|InvokeMember|Reflection/);
+    // Its one native import is the foreground-window query; no input synthesis, no process access.
+    expect([...engine.matchAll(/DllImport\("([^"]+)"\)\] static extern \w+ (\w+)/g)].map((match) => `${match[1]}:${match[2]}`)).toEqual([
+      'user32.dll:GetForegroundWindow',
+    ]);
+    expect(engine).not.toMatch(/SendInput|SetCursorPos|keybd_event|mouse_event|OpenProcess|ReadProcessMemory|CreateRemoteThread/);
+    // It travels on a command line: bounded well under Windows' 32,767 characters.
+    expect(engine.length).toBeLessThan(30_000);
+  });
+
+  it('starts the engine with a minimal environment, MTA, no shell, no window', () => {
+    const desktop = fs.readFileSync(DESKTOP_FILES.find((file) => file.rel === PROGRAM_FILES[0])!.abs, 'utf8');
+    const start = desktop.slice(desktop.indexOf('export function startUiaEngine'), desktop.indexOf('export function startUiaEngine') + 1_500);
+    expect(start).toMatch(/'-MTA', '-Command', UIA_HOST_SCRIPT/);
+    expect(start).toMatch(/env: environment/);
+    expect(start).not.toMatch(/process\.env\b(?!\[name\])|shell:\s*true/);
+    expect(desktop).toMatch(/UIA_ENVIRONMENT_NAMES = \['SystemRoot', 'windir', 'SystemDrive', 'TEMP', 'TMP', 'PATH', 'USERPROFILE', 'LOCALAPPDATA'\]/);
+  });
+});
+
+describe('SECURITY: the renderer cannot reach the desktop', () => {
+  const rendererFiles = filesUnder(DESKTOP_FILES, 'apps/desktop/src/renderer/');
+  const preloadFiles = filesUnder(DESKTOP_FILES, 'apps/desktop/src/preload/');
+
+  it('imports nothing from the main tree at all', () => {
+    for (const file of [...rendererFiles, ...preloadFiles]) {
+      expect(
+        importsMatching(file, (s) => /(^|\/)main\//.test(s) || /\.\.\/main/.test(s)),
+        `${file.rel} must not import from main`,
+      ).toEqual([]);
+    }
+  });
+
+  it('has no IPC channel that names a tool, a window, a control or a screen', () => {
+    // The renderer asks main to render a timeline and to answer approvals. It
+    // does not ask main to run anything. A channel named for a capability
+    // would be the beginning of a second door.
+    const ipc = fs.readFileSync(path.resolve(CORE_SRC, 'ipc.ts'), 'utf8').toLowerCase();
+    for (const forbidden of ['ui.click', 'keyboard', 'screenshot', 'spawn', 'powershell']) {
+      expect(ipc, `the IPC contract must not name ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it('names no tool of its own, in the bridge or in the renderer', () => {
+    // The bridge has ONE way to propose a tool call — `invokeTool(name, input)`
+    // — and it carries no knowledge of what any tool is. A member named for a
+    // capability would be a second door with a shorter path.
+    const bridge = fs.readFileSync(preloadFiles[0]!.abs, 'utf8');
+    for (const forbidden of ['ui.click', 'keyboard.type', 'system.screenshot', 'app.open', 'window.focus']) {
+      expect(bridge, `the bridge must not name ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it('reaches a tool only through the dispatcher, and only in a dev build', () => {
+    // The developer Tool Console is real and it is not a hole: it proposes,
+    // exactly as the brain and the voice agent propose, and the same schema,
+    // precheck, budget, risk, policy, duplicate and approval gates apply.
+    // What it may NOT do is bypass any of that, and this asserts both halves.
+    const handler = fs.readFileSync(
+      DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/bus/renderer-bridge.ts')!.abs,
+      'utf8',
+    );
+    const invoke = handler.slice(handler.indexOf('IPC_CHANNELS.TOOL_INVOKE'));
+
+    expect(invoke, 'the console must be disabled outside a dev build').toMatch(/devConsoleEnabled/);
+    expect(invoke, 'the console must go through the orchestrator, not a registry').toMatch(
+      /orchestrator\.invokeTool\(/,
+    );
+
+    // And the bridge itself holds no registry, no executor and no platform.
+    for (const file of [...preloadFiles, ...rendererFiles]) {
+      expect(
+        importsMatching(
+          file,
+          (s) => isExecutorImport(s) || /tools\/registry|platform\/|safety\//.test(s),
+        ),
+        `${file.rel} must reach no executor, registry, platform or safety module`,
+      ).toEqual([]);
+    }
+  });
+
+  it('lets the renderer bridge propose, and never execute', () => {
+    // `invokeTool` hands main a NAME and a value. It cannot hand main a
+    // function, a path, or a program — there is nothing in the payload schema
+    // that could carry one.
+    const handler = fs.readFileSync(
+      DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/bus/renderer-bridge.ts')!.abs,
+      'utf8',
+    );
+    expect(handler).toMatch(/toolInvokePayload/);
+    for (const forbidden of ['child_process', 'spawn(', 'powershell', 'executeJavaScript']) {
+      expect(handler, `the bridge handler must not name ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+});
+
+/**
+ * Phase 3's boundaries: the task ledger, and the one door it did not open.
+ *
+ * A task is the most dangerous-looking structure added so far, because a thing
+ * that knows "what Axon is doing" is one refactor away from being a thing that
+ * decides what Axon may do. These rules keep it on the right side of that: it
+ * records, it refuses, and it grants nothing.
+ */
+describe('BOUNDARY: the task ledger records and refuses, and grants nothing', () => {
+  const ledgerFile = DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/agent/task-ledger.ts');
+
+  it('exists, so these rules are not vacuous', () => {
+    expect(ledgerFile).toBeDefined();
+  });
+
+  it('reaches no executor, no registry, no safety layer and no platform', () => {
+    // The list is the point. A ledger that could reach any of these could
+    // become a second path from "I know what we are doing" to "so do it".
+    const forbidden = (specifier: string): boolean =>
+      isExecutorImport(specifier) ||
+      /(^|\/)tools\/registry(\.js)?$/.test(specifier) ||
+      /(^|\/)safety\//.test(specifier) ||
+      /(^|\/)platform\//.test(specifier) ||
+      /(^|\/)screen\//.test(specifier) ||
+      /(^|\/)persistence\//.test(specifier);
+
+    expect(importsMatching(ledgerFile!, forbidden)).toEqual([]);
+  });
+
+  it('imports nothing but the shared contracts', () => {
+    // One import, and it is the pure package. Anything else would be a
+    // capability arriving in the one module that is supposed to have none.
+    expect(ledgerFile!.imports).toEqual(['@axon/core']);
+  });
+
+  it('touches no filesystem, spawns no process and reaches no network', () => {
+    const source = fs.readFileSync(ledgerFile!.abs, 'utf8');
+    expect(source).not.toMatch(/fetch\(|WebSocket|require\(/);
+    expect(
+      importsMatching(ledgerFile!, (s) => /^(node:)?(fs|child_process|http|https|net)/.test(s)),
+    ).toEqual([]);
+  });
+
+  it('exposes no verb that could run anything', () => {
+    // Read as a shape, not as a list of names to avoid. There is no `run`, no
+    // `execute`, no `dispatch`, no `enqueue` — and, most importantly, no
+    // `approve` or `allow`, because a task must never be a permission.
+    const source = fs.readFileSync(ledgerFile!.abs, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    for (const forbidden of ['execute(', 'dispatch(', 'enqueue(', 'approve(', 'allow(', 'authorize(']) {
+      expect(source, `the ledger must not expose ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it('holds no queue of pending actions', () => {
+    // The structural version of "one approval authorises one act". A list of
+    // actions waiting to run is exactly what would let an approval travel to
+    // the next one.
+    const source = fs.readFileSync(ledgerFile!.abs, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(source).not.toMatch(/queue|pendingActions|plan\s*[:=]/i);
+  });
+
+  it('is not reachable from the renderer or the preload bridge', () => {
+    for (const surface of ['apps/desktop/src/renderer/', 'apps/desktop/src/preload/']) {
+      for (const file of filesUnder(DESKTOP_FILES, surface)) {
+        expect(
+          importsMatching(file, (s) => /task-ledger/.test(s)),
+          `${file.rel} must not reach the task ledger`,
+        ).toEqual([]);
+      }
+    }
+  });
+});
+
+describe('BOUNDARY: there is still exactly one call site that runs a tool', () => {
+  it('is in the dispatcher, and nowhere else', () => {
+    // Phase 3 added a lifecycle around execution — an inline budget, an
+    // in-progress answer, a late delivery path. None of them execute anything:
+    // they all wait on the same one `dispatch`, which reaches the same one
+    // `execute`. This asserts that the new machinery did not grow a shortcut.
+    const callers = DESKTOP_FILES.filter((file) => {
+      const source = fs.readFileSync(file.abs, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+      return /\btool\.execute\(/.test(source);
+    }).map((file) => file.rel);
+
+    expect(callers).toEqual(['apps/desktop/src/main/safety/dispatcher.ts']);
+  });
+
+  it('routes the voice bridge through a callback it cannot widen', () => {
+    // The bridge holds `dispatch` and nothing else. It cannot reach a
+    // registry, an executor, a policy, a broker or a budget — so every path
+    // through its new lifecycle ends at the same door.
+    const bridge = DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/agent/tool-bridge.ts');
+    expect(bridge).toBeDefined();
+
+    const forbidden = (s: string): boolean =>
+      isExecutorImport(s) || /tools\/registry|safety\/|platform\/|screen\//.test(s);
+    expect(importsMatching(bridge!, forbidden)).toEqual([]);
+  });
+});
+
+describe('OBSERVABILITY: a task can be reconstructed, and carries nothing it should not', () => {
+  it('traces a step without carrying its arguments or its output', () => {
+    // Traces reach the timeline, the renderer and the JSONL log on disk. A
+    // typed password, a page of text, or a URL with a token in it has no
+    // business in any of them, so the trace type carries none of those fields.
+    const contract = fs.readFileSync(path.resolve(CORE_SRC, 'task.ts'), 'utf8');
+    const trace = contract.slice(contract.indexOf('export interface TaskStepTrace'));
+    const body = trace.slice(0, trace.indexOf('}'));
+
+    for (const forbidden of ['input', 'arguments', 'args', 'output', 'text', 'value', 'goal']) {
+      expect(body, `a step trace must not carry ${forbidden}`).not.toMatch(new RegExp(`\\breadonly ${forbidden}\\b`));
+    }
+    // And it does carry what a reconstruction needs.
+    for (const needed of ['taskId', 'stepId', 'tool', 'outcome', 'risk', 'approval', 'verified']) {
+      expect(body, `a step trace must carry ${needed}`).toMatch(new RegExp(`\\breadonly ${needed}\\b`));
+    }
+  });
+
+  it('emits traces onto the one event stream rather than a second log', () => {
+    // A second account of what happened is a second account that can disagree
+    // with the first. The trace goes onto the same bus everything else does.
+    const source = fs.readFileSync(
+      DESKTOP_FILES.find((file) => file.rel === 'apps/desktop/src/main/orchestrator/orchestrator.ts')!.abs,
+      'utf8',
+    );
+    const wiring = source.slice(source.indexOf('new TaskLedger('), source.indexOf('new TaskLedger(') + 900);
+    expect(wiring).toMatch(/this\.bus\.emit\(/);
+    expect(wiring).toMatch(/task: trace\.taskId/);
+    expect(wiring).toMatch(/step: trace\.stepId/);
+  });
+});
+
+/**
+ * The wake DIRECTORY, not just the wake word.
+ *
+ * The rule above holds one file to one import. That was enough while there was
+ * one detector. There are now two, plus a child process that runs a speech
+ * model, and "the microphone is open and the audio goes nowhere" has to stay
+ * checkable by reading import blocks rather than by trusting that nobody added
+ * a socket to the third file down.
+ *
+ * So every file in `main/wake/` is listed here with exactly what it may
+ * import. The list is exhaustive in both directions: a file not on it fails,
+ * and an import not on its entry fails. Adding either is a deliberate act with
+ * a diff, which is the point.
+ */
+describe('BOUNDARY: everything that listens before activation', () => {
+  const ALLOWED: Readonly<Record<string, readonly string[]>> = {
+    // The original detector. One import, and it stays one import.
+    'apps/desktop/src/main/wake/wake-word.ts': ['@axon/core'],
+    // Types only.
+    'apps/desktop/src/main/wake/wake-detector.ts': [],
+    // The wake phrase itself. Pure, and imports nothing at all.
+    'apps/desktop/src/main/wake/wake-keywords.ts': [],
+    // The keyword detector's decision logic. Its spotter is handed in.
+    'apps/desktop/src/main/wake/keyword-wake-detector.ts': [
+      '@axon/core',
+      './wake-detector.js',
+      './keyword-engine.js',
+      './wake-keywords.js',
+    ],
+    // The ONE file allowed to start a process. No network module on this list.
+    'apps/desktop/src/main/wake/keyword-engine.ts': ['node:child_process', 'node:fs', 'node:path', './wake-keywords.js'],
+    // The child program. Reads a model, writes three line shapes.
+    'apps/desktop/src/main/wake/kws-host.ts': [
+      'node:fs',
+      'node:os',
+      'node:path',
+      'node:module',
+      './wake-keywords.js',
+      './kws-queue.js',
+      './kws-focus.js',
+    ],
+    // The spotter's bounded, drop-oldest audio queue. Pure; imports nothing.
+    'apps/desktop/src/main/wake/kws-queue.ts': [],
+    // The focus DIAGNOSTIC, run inside a second spotter process. It is handed
+    // the native runtime by `kws-host.ts` rather than loading it, so the model
+    // is still named in exactly one file. No network module.
+    'apps/desktop/src/main/wake/kws-focus.ts': [
+      'node:fs',
+      'node:path',
+      './wake-keywords.js',
+      './kws-queue.js',
+      './focus-report.js',
+    ],
+    // Classifying focus measurements. Pure; imports nothing.
+    'apps/desktop/src/main/wake/focus-report.ts': [],
+    // Several spotters at once, for threshold calibration.
+    'apps/desktop/src/main/wake/calibration-engine.ts': ['./keyword-engine.js'],
+    // The switch between engines.
+    'apps/desktop/src/main/wake/create-wake-detector.ts': [
+      '@axon/core',
+      './wake-detector.js',
+      './keyword-wake-detector.js',
+      './keyword-engine.js',
+      './wake-word.js',
+      './wake-keywords.js',
+      './calibration-engine.js',
+    ],
+    // The hotkey, which is a wake SOURCE rather than a detector.
+    'apps/desktop/src/main/wake/global-hotkey.ts': ['electron', '@axon/core'],
+  };
+
+  const wakeFiles = filesUnder(DESKTOP_FILES, 'apps/desktop/src/main/wake/');
+
+  it('has every file in the directory on the list, and nothing else', () => {
+    // Both directions: a new file that nobody wrote a rule for fails here
+    // rather than quietly inheriting no rule at all.
+    expect(wakeFiles.map((file) => file.rel).sort()).toEqual(Object.keys(ALLOWED).sort());
+  });
+
+  it('holds each file to the imports its entry allows', () => {
+    for (const file of wakeFiles) {
+      const allowed = ALLOWED[file.rel] ?? [];
+      for (const specifier of file.imports) {
+        expect(allowed.includes(specifier), `${file.rel} imported ${specifier}`).toBe(true);
+      }
+    }
+  });
+
+  it('gives none of them a way to open a socket', () => {
+    // The mechanism behind "before activation, audio stays local": while the
+    // wake word is the reason the microphone is open, there is no code path
+    // from any of it to a network.
+    const networking = /^(ws|node:net|node:http|node:https|node:tls|node:dgram|node:dns|undici|axios)$/;
+    for (const file of wakeFiles) {
+      expect(importsMatching(file, (specifier) => networking.test(specifier)), file.rel).toEqual([]);
+    }
+  });
+
+  it('keeps the local half and the remote half separable', () => {
+    for (const file of wakeFiles) {
+      expect(importsMatching(file, (specifier) => /(^|\/)agent\//.test(specifier)), file.rel).toEqual([]);
+    }
+    for (const file of filesUnder(DESKTOP_FILES, 'apps/desktop/src/main/agent/')) {
+      expect(importsMatching(file, (specifier) => /wake/.test(specifier))).toEqual([]);
+    }
+  });
+
+  it('loads the speech model in exactly one file, and that file is a program nobody imports', () => {
+    // `kws-host.ts` reaches the model through `createRequire`, which no import
+    // scanner sees, so this one is checked against the source text. It is the
+    // only file in the desktop app that names the native runtime, and nothing
+    // imports it — it is spawned, which is what makes the process boundary
+    // real rather than decorative.
+    // A QUOTED specifier, not the words: `create-wake-detector.ts` argues in
+    // prose about which engines were weighed, and a rule that matched prose
+    // would punish the file for explaining itself.
+    const naming = DESKTOP_FILES.filter((file) =>
+      /['"]sherpa-onnx-node['"]/.test(fs.readFileSync(file.abs, 'utf8')),
+    );
+    expect(naming.map((file) => file.rel)).toEqual(['apps/desktop/src/main/wake/kws-host.ts']);
+
+    for (const file of DESKTOP_FILES) {
+      expect(importsMatching(file, (specifier) => /kws-host/.test(specifier)), file.rel).toEqual([]);
+    }
+  });
+
+  it('spawns the spotter with an environment that holds no credential', () => {
+    // The spotter runs for hours with a microphone open. Axon's main process
+    // has both API keys in its environment; this is what keeps them out of the
+    // one process that is always listening.
+    const source = fs.readFileSync(
+      path.resolve(DESKTOP_SRC, 'main/wake/keyword-engine.ts'),
+      'utf8',
+    );
+    expect(source).toMatch(/SPOTTER_ENV_NAMES/);
+    expect(source).not.toMatch(/ANTHROPIC_API_KEY|ASSEMBLYAI_API_KEY/);
+    // `env:` is passed explicitly, so the child cannot inherit main's.
+    expect(source).toMatch(/env: spotterEnvironment\(\)/);
+    expect(source).toMatch(/shell: false/);
   });
 });

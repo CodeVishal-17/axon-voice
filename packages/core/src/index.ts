@@ -11,7 +11,10 @@
 
 export * from './states.js';
 export * from './agent.js';
+export * from './task.js';
 export * from './risk.js';
+export * from './sensitivity.js';
+export * from './identity.js';
 export * from './approval.js';
 export * from './json.js';
 export * from './events.js';
@@ -20,6 +23,7 @@ export * from './speech.js';
 export * from './listening.js';
 export * from './voice-agent.js';
 export * from './browsing.js';
+export * from './observation.js';
 export * from './persistence.js';
 export * from './ipc.js';
 export * from './interfaces/index.js';

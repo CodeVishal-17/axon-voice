@@ -67,12 +67,29 @@ export function classifySideEffect(tool: string, input: unknown): SideEffectClas
 
     case 'fs.write':
     case 'app.open':
-    case 'system.screenshot':
+    case 'app.launch':
+    case 'app.focus':
+    case 'web.open':
     case 'memory.save':
     case 'memory.forget':
       return 'LOCAL';
 
+    // Looking at the screen sends nothing and writes nothing, unless a file
+    // was explicitly asked for. The arguments decide, exactly as they do for
+    // `browser.type`.
+    case 'system.screenshot':
+      return args.save === true ? 'LOCAL' : 'NONE';
+
+    // Activating a control makes a local application do something, and typing
+    // puts text into one. Neither leaves the machine on its own — but the
+    // dispatcher promotes anything the policy gated to EXTERNAL, and almost
+    // everything here is gated, so a repeat is refused rather than replayed.
+    case 'ui.click':
+    case 'keyboard.type':
+      return 'LOCAL';
+
     case 'memory.search':
+    case 'system.time':
       return 'NONE';
 
     default:
@@ -96,7 +113,20 @@ export function describeAction(tool: string, input: unknown): string {
     case 'fs.write':
       return 'write a file';
     case 'app.open':
+    case 'app.launch':
       return 'open an application';
+    case 'app.focus':
+      return 'switch to an application';
+    case 'web.open':
+      return 'open a web page in your browser';
+    case 'ui.click':
+      return 'activate a control on screen';
+    case 'keyboard.type':
+      return 'type into a field on screen';
+    case 'system.screenshot':
+      return args.save === true ? 'save a screenshot' : 'look at the screen';
+    case 'system.time':
+      return 'check the time';
     case 'memory.save':
       return 'remember something';
     case 'memory.forget':
@@ -127,6 +157,8 @@ function targetOf(tool: string, input: unknown, page: string | null): string | n
     return typeof args.url === 'string' ? args.url : page;
   }
   if (tool.startsWith('browser.')) return page;
+  if (tool === 'web.open') return typeof args.url === 'string' ? args.url : null;
+  if (tool === 'app.launch') return typeof args.app === 'string' ? args.app : null;
   if (tool === 'fs.write') return typeof args.path === 'string' ? args.path : null;
   return null;
 }

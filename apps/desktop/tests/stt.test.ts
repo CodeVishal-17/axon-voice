@@ -78,6 +78,28 @@ if (mode === 'never-ready') {
       process.stdout.write(phrase('7.500', 'too confident'));
       process.stdout.write('END\n');
       process.exit(0);
+    } else if (mode === 'wake-grammar') {
+      const b64 = (text) => Buffer.from(text, 'utf8').toString('base64');
+      process.stdout.write('GRAMMAR wake\n');
+      process.stdout.write('GRAMMAR near-miss\n');
+      process.stdout.write('RECOGNIZER en-US ' + b64('MS-1033-80-DESK') + '\n');
+      process.stdout.write('FORMAT 16000 16 mono\n');
+      process.stdout.write('SPEECH\n');
+      process.stdout.write('NEAR 0.910 ' + b64('hey jackson') + '\n');
+      process.stdout.write('REJECTED 0.120 ' + b64('but who') + '\n');
+      process.stdout.write('WAKE 0.870 ' + b64('hey axon') + ' 460 940\n');
+      process.stdout.write('END\n');
+      process.exit(0);
+    } else if (mode === 'report-env') {
+      const secrets = Object.keys(process.env).filter((name) => /KEY|TOKEN|SECRET|PASSWORD|ASSEMBLY|ANTHROPIC/i.test(name));
+      process.stdout.write(phrase('1.000', secrets.length === 0 ? 'none' : secrets.join(',')));
+      process.stdout.write('END\n');
+      process.exit(0);
+    } else if (mode === 'wake-phrase') {
+      process.stdout.write('WAKE 0.830 ' + Buffer.from('hey axon', 'utf8').toString('base64') + '\n');
+      process.stdout.write(phrase('0.400', 'i was talking about axon yesterday'));
+      process.stdout.write('END\n');
+      process.exit(0);
     } else {
       process.stdout.write(phrase('0.700', 'open notepad'));
       process.stdout.write('END\n');
@@ -346,5 +368,92 @@ describe('failures', () => {
     await session.end();
     await expect(session.end()).resolves.toBeUndefined();
     session.close();
+  });
+});
+
+describe('the wake grammar result', () => {
+  it('reports which grammar produced each phrase', async () => {
+    // WAKE is the wake grammar matching; PHRASE is dictation. The detector
+    // wakes only on the first, so the distinction has to survive the pipe.
+    const { chunks, onChunk } = collector();
+    const session = await recognizer('wake-phrase').start(onChunk, { mode: 'wake' });
+
+    session.push(frame());
+    await session.end();
+
+    expect(chunks.map((chunk) => [chunk.source, chunk.text])).toEqual([
+      ['wake-phrase', 'hey axon'],
+      ['dictation', 'i was talking about axon yesterday'],
+    ]);
+    expect(chunks[0]?.confidence).toBeCloseTo(0.83, 3);
+    session.close();
+  });
+
+  it('tags ordinary dictation as dictation', async () => {
+    const { chunks, onChunk } = collector();
+    const session = await recognizer('ok').start(onChunk);
+    session.push(frame());
+    await session.end();
+    expect(chunks[0]?.source).toBe('dictation');
+    session.close();
+  });
+
+  it('tags a near-miss as a near-miss, and never turns a diagnostic into a transcript', async () => {
+    const { chunks, onChunk } = collector();
+    const diagnostics: string[] = [];
+    const session = await recognizer('wake-grammar').start(onChunk, {
+      mode: 'wake',
+      onDiagnostic: (line) => diagnostics.push(line),
+    });
+
+    session.push(frame());
+    await session.end();
+
+    expect(chunks.map((chunk) => [chunk.source, chunk.text])).toEqual([
+      ['near-miss', 'hey jackson'],
+      ['wake-phrase', 'hey axon'],
+    ]);
+    expect(diagnostics).toEqual([
+      'grammar loaded: wake',
+      'grammar loaded: near-miss',
+      'recognizer initialized: MS-1033-80-DESK, culture en-US',
+      'audio format: 16000 Hz, 16-bit, mono',
+      'recognizer detected speech',
+      '[REJECTED] 0.120 "but who" (below the engine\'s rejection threshold)',
+    ]);
+    // Timing travels with a result when the recognizer gives it, and is
+    // simply absent when it does not.
+    expect(chunks[0]?.span).toBeUndefined();
+    expect(chunks[1]?.span).toEqual({ startMs: 460, durationMs: 940 });
+    session.close();
+  });
+
+  it('reports nothing to a session that did not ask for diagnostics', async () => {
+    const { chunks, onChunk } = collector();
+    const session = await recognizer('wake-grammar').start(onChunk, { mode: 'wake' });
+    session.push(frame());
+    await session.end();
+    expect(chunks).toHaveLength(2);
+    session.close();
+  });
+});
+
+describe('the recognizer process environment', () => {
+  it('does not inherit the voice agent credential', async () => {
+    const previous = process.env.ASSEMBLYAI_API_KEY;
+    process.env.ASSEMBLYAI_API_KEY = 'sentinel-credential-for-this-test';
+    try {
+      const { chunks, onChunk } = collector();
+      const session = await recognizer('report-env').start(onChunk);
+      session.push(frame());
+      await session.end();
+      // Windows adds a few variables of its own to any child, so the property
+      // is not a count: it is that nothing shaped like a credential arrives.
+      expect(chunks[0]?.text).toBe('none');
+      session.close();
+    } finally {
+      if (previous === undefined) delete process.env.ASSEMBLYAI_API_KEY;
+      else process.env.ASSEMBLYAI_API_KEY = previous;
+    }
   });
 });

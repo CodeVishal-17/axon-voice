@@ -29,6 +29,10 @@
  *     forge a second line of protocol.
  *   - The child gets no shell: `spawn` is called with an argv array and
  *     `shell: false`.
+ *   - The child gets no secrets. It is spawned with a fixed allowlist of six
+ *     environment variables (see `recognizerEnvironment`), so the AssemblyAI
+ *     key Axon's main process holds is not even present in the recognizer's
+ *     environment — least of all in the one that listens while Axon is idle.
  *
  * NOTHING TOUCHES DISK. The audio lives in a `MemoryStream` inside the child
  * and in the pipe between the two processes. There is no temporary WAV file at
@@ -37,7 +41,13 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { LISTENING_LIMITS, type SpeechToText, type SpeechToTextSession, type TranscriptChunk } from '@axon/core';
+import {
+  LISTENING_LIMITS,
+  type SpeechToText,
+  type SpeechToTextOptions,
+  type SpeechToTextSession,
+  type TranscriptChunk,
+} from '@axon/core';
 
 /**
  * The complete program run in the child process.
@@ -51,17 +61,155 @@ import { LISTENING_LIMITS, type SpeechToText, type SpeechToTextSession, type Tra
  * load while the user is still drawing breath, and by the time they stop
  * speaking the only work left is the recognition itself.
  */
-const SCRIPT = [
+const HEADER = [
   "$ErrorActionPreference = 'Stop'",
   'Add-Type -AssemblyName System.Speech',
   '$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(' +
     '16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, ' +
     '[System.Speech.AudioFormat.AudioChannel]::Mono)',
   '$engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine',
-  // Free-form dictation rather than a fixed command grammar: Axon's whole
-  // premise is that the model interprets what was said, so constraining the
-  // recognizer to a phrase list would constrain the product.
-  '$engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))',
+];
+
+/**
+ * Free-form dictation, for push-to-talk: Axon's premise is that the model
+ * interprets what was said, so constraining the recognizer to a phrase list
+ * would constrain the product.
+ */
+const DICTATION_GRAMMAR = [
+  '$dictation = New-Object System.Speech.Recognition.DictationGrammar',
+  "$dictation.Name = 'dictation'",
+  '$engine.LoadGrammar($dictation)',
+];
+
+/**
+ * The wake grammars: the phrase, and the things that merely sound like it.
+ *
+ * WHY THERE IS NO DICTATION HERE ANY MORE. The first wake grammar ran beside
+ * free dictation, so that ordinary speech would be recognised as ordinary
+ * speech. On synthesised voices that worked. On a real person's microphone it
+ * did not: dictation's language model out-competed the wake grammar every
+ * time, and "Hey Axon", "Hello Axon" and "Hi Axon" came back as "But who",
+ * "And who" and "New song". A wake phrase that loses to the most likely
+ * English sentence can never win.
+ *
+ * WHY A GRAMMAR ON ITS OWN IS STILL NOT ENOUGH. With nothing to compete
+ * against, a grammar forces whatever it hears onto the nearest thing it
+ * knows. Measured on the Windows recognizer: "Axon", "Taxon", "action",
+ * "Hey Jackson" and "I was talking about Axon yesterday" all came back as a
+ * wake phrase — ten false wakes in fifty-two.
+ *
+ * SO THE COMPETITOR IS A LIST OF NEAR MISSES. Each half of the phrase on its
+ * own ("hey", "axon"), the words it is most often confused with ("action",
+ * "exon", "taxon", "oxen"), the greeting with other names ("hey jackson",
+ * "hey siri"), and short everyday words. Speech that is not a wake phrase has
+ * somewhere closer to land. Measured on the same engine: 22 of 24 wake phrases
+ * matched, and none of 52 non-wake utterances did.
+ *
+ * What the list deliberately does NOT contain is what the human microphone
+ * test produced ("but who", "and who", "new song"). Putting a real mishearing
+ * of the wake phrase into the competitor would teach the recognizer to reject
+ * the person it is supposed to hear. Those phrases are tested as negatives
+ * instead, and they must not wake Axon on their own merits.
+ *
+ * Every string here is a constant; nothing is interpolated.
+ */
+const WAKE_GRAMMAR = [
+  '$wakeBuilder = New-Object System.Speech.Recognition.GrammarBuilder',
+  "$wakeBuilder.Append((New-Object System.Speech.Recognition.Choices([string[]]@('hey', 'hello', 'hi'))))",
+  "$wakeBuilder.Append('axon')",
+  '$wake = New-Object System.Speech.Recognition.Grammar($wakeBuilder)',
+  "$wake.Name = 'wake'",
+  '$engine.LoadGrammar($wake)',
+  "[Console]::Out.WriteLine('GRAMMAR wake')",
+  '$nearBuilder = New-Object System.Speech.Recognition.GrammarBuilder',
+  "$nearBuilder.Append((New-Object System.Speech.Recognition.Choices([string[]]@(" +
+    "'hey', 'hello', 'hi', 'axon', 'axons', 'taxon', 'action', 'actions', 'exon', 'accent', 'access', 'axel', " +
+    "'oxen', 'jackson', 'saxon', 'hey alex', 'hey jackson', 'hey siri', 'hi there', 'hello there', 'hey you', " +
+    "'hi everyone', 'hello everyone', 'eight', 'song', 'who', 'own', 'okay', 'yes', 'no', 'thanks', 'thank you', " +
+    "'what', 'open'))))",
+  '$near = New-Object System.Speech.Recognition.Grammar($nearBuilder)',
+  "$near.Name = 'near-miss'",
+  '$engine.LoadGrammar($near)',
+  "[Console]::Out.WriteLine('GRAMMAR near-miss')",
+];
+
+/**
+ * The wake session's body: the same batch shape as dictation's, plus the
+ * recognizer's own account of itself for developer diagnostics.
+ *
+ * Before READY it names the engine, its culture and the audio format. While
+ * recognising it reports SPEECH when the engine detects speech and REJECTED
+ * with the engine's best guess when a candidate falls below its rejection
+ * threshold, so "not heard", "heard and rejected" and "heard as something
+ * else" are three different lines rather than one silence. A result from the
+ * wake grammar is WAKE; one from the near-miss grammar is NEAR. Both carry
+ * the matched audio's position and duration in milliseconds, so the detector
+ * can tell a phrase said on its own from one found inside a sentence.
+ */
+const WAKE_BODY = [
+  "[Console]::Out.WriteLine('RECOGNIZER ' + $engine.RecognizerInfo.Culture.Name + ' ' + " +
+    '[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($engine.RecognizerInfo.Name)))',
+  "[Console]::Out.WriteLine('FORMAT 16000 16 mono')",
+  "$null = Register-ObjectEvent -InputObject $engine -EventName SpeechDetected -SourceIdentifier 'detected'",
+  "$null = Register-ObjectEvent -InputObject $engine -EventName SpeechRecognitionRejected -SourceIdentifier 'rejected'",
+  "[Console]::Out.WriteLine('READY')",
+  '[Console]::Out.Flush()',
+  // Audio is DATA arriving on stdin. It is never part of this program.
+  '$audio = New-Object System.IO.MemoryStream',
+  '[Console]::OpenStandardInput().CopyTo($audio)',
+  '$audio.Position = 0',
+  "[Console]::Out.WriteLine('AUDIO ' + $audio.Length)",
+  '[Console]::Out.Flush()',
+  '$engine.SetInputToAudioStream($audio, $fmt)',
+  '$inv = [System.Globalization.CultureInfo]::InvariantCulture',
+  // Bounded: a short utterance holds at most a few phrases.
+  'for ($attempt = 0; $attempt -lt 6; $attempt++) {',
+  '  $r = $null',
+  '  try { $r = $engine.Recognize() } catch { break }',
+  '  $rejected = $null',
+  '  foreach ($ev in @(Get-Event -ErrorAction SilentlyContinue)) {',
+  "    if ($ev.SourceIdentifier -eq 'detected') { [Console]::Out.WriteLine('SPEECH') }",
+  "    if ($ev.SourceIdentifier -eq 'rejected') { $rejected = $ev.SourceEventArgs.Result }",
+  '    Remove-Event -EventIdentifier $ev.EventIdentifier',
+  '  }',
+  '  if ($null -eq $r) {',
+  '    if ($null -eq $rejected) { break }',
+  '    $rb = [System.Text.Encoding]::UTF8.GetBytes([string]$rejected.Text)',
+  "    [Console]::Out.WriteLine('REJECTED ' + $rejected.Confidence.ToString('0.000', $inv) + ' ' + [Convert]::ToBase64String($rb))",
+  '    [Console]::Out.Flush()',
+  '    continue',
+  '  }',
+  '  $b = [System.Text.Encoding]::UTF8.GetBytes($r.Text)',
+  "  $start = '-1'",
+  "  $duration = '-1'",
+  '  if ($null -ne $r.Audio) {',
+  '    $start = [string][int]$r.Audio.AudioPosition.TotalMilliseconds',
+  '    $duration = [string][int]$r.Audio.Duration.TotalMilliseconds',
+  '  }',
+  "  $verb = 'NEAR '",
+  "  if ($r.Grammar.Name -eq 'wake') { $verb = 'WAKE ' }",
+  "  [Console]::Out.WriteLine($verb + $r.Confidence.ToString('0.000', $inv) + ' ' + [Convert]::ToBase64String($b) + ' ' + $start + ' ' + $duration)",
+  '  [Console]::Out.Flush()',
+  '}',
+  "[Console]::Out.WriteLine('END')",
+  '[Console]::Out.Flush()',
+  '$engine.Dispose()',
+  '$audio.Dispose()',
+];
+
+/**
+ * Everything after the grammars: announce READY, read the audio, recognise.
+ *
+ * The engine and its grammars are loaded BEFORE the first byte of audio is
+ * read, and READY is printed the moment they are, so by the time somebody
+ * stops speaking the only work left is the recognition itself.
+ *
+ * A result from the wake grammar is reported as WAKE, anything else as
+ * PHRASE, so the process on the other side of the pipe can tell "the wake
+ * grammar matched" from "some words were recognised" without trusting the
+ * text to say so.
+ */
+const BODY = [
   "[Console]::Out.WriteLine('READY')",
   '[Console]::Out.Flush()',
   // Audio is DATA arriving on stdin. It is never part of this program.
@@ -77,7 +225,9 @@ const SCRIPT = [
   '  try { $r = $engine.Recognize() } catch { break }',
   '  if ($null -eq $r) { break }',
   '  $b = [System.Text.Encoding]::UTF8.GetBytes($r.Text)',
-  "  [Console]::Out.WriteLine('PHRASE ' + $r.Confidence.ToString('0.000', " +
+  "  $verb = 'PHRASE '",
+  "  if ($r.Grammar.Name -eq 'wake') { $verb = 'WAKE ' }",
+  "  [Console]::Out.WriteLine($verb + $r.Confidence.ToString('0.000', " +
     '[System.Globalization.CultureInfo]::InvariantCulture) + ' +
     "' ' + [Convert]::ToBase64String($b))",
   '  [Console]::Out.Flush()',
@@ -86,7 +236,13 @@ const SCRIPT = [
   '[Console]::Out.Flush()',
   '$engine.Dispose()',
   '$audio.Dispose()',
-].join('\n');
+];
+
+/** The dictation program. A module constant, never a template. */
+const SCRIPT = [...HEADER, ...DICTATION_GRAMMAR, ...BODY].join('\n');
+
+/** The wake-word program. Also a module constant, never a template. */
+const WAKE_SCRIPT = [...HEADER, ...WAKE_GRAMMAR, ...WAKE_BODY].join('\n');
 
 const POWERSHELL = 'powershell.exe';
 
@@ -98,6 +254,9 @@ const POWERSHELL = 'powershell.exe';
  */
 const DEFAULT_ARGS: readonly string[] = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', SCRIPT];
 
+/** The argv for a wake session: the same shape, the other constant program. */
+const WAKE_ARGS: readonly string[] = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', WAKE_SCRIPT];
+
 /**
  * Longest line accepted on the child's stdout.
  *
@@ -106,6 +265,29 @@ const DEFAULT_ARGS: readonly string[] = ['-NoProfile', '-NonInteractive', '-Exec
  * anything a person said.
  */
 const MAX_LINE_BYTES = 64 * 1024;
+
+/**
+ * The only environment variables a recognizer process is given.
+ *
+ * Enough for Windows PowerShell and .NET to start, and nothing else. Axon's
+ * main process holds the AssemblyAI key in its environment; a child spawned
+ * with the default environment would inherit it. The wake recognizer runs for
+ * hours while nobody is talking to Axon, so it is exactly the process that
+ * should hold nothing worth taking.
+ */
+const RECOGNIZER_ENV_NAMES: readonly string[] = ['SystemRoot', 'windir', 'SystemDrive', 'TEMP', 'TMP', 'Path'];
+
+/** Build a recognizer's environment from the allowlist. Names match case-insensitively, as Windows does. */
+export function recognizerEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  const keys = Object.keys(source);
+  for (const name of RECOGNIZER_ENV_NAMES) {
+    const key = keys.find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+    const value = key === undefined ? undefined : source[key];
+    if (typeof value === 'string' && value !== '') env[name] = value;
+  }
+  return env;
+}
 
 /** How long the recognizer has to load before Axon gives up on it. */
 const WARMUP_TIMEOUT_MS = 12_000;
@@ -149,6 +331,7 @@ export class WindowsSpeechToText implements SpeechToText {
 
   private readonly executable: string;
   private readonly args: readonly string[];
+  private readonly wakeArgs: readonly string[];
   private readonly platform: NodeJS.Platform;
   private readonly warmupTimeoutMs: number;
   private readonly transcriptionTimeoutMs: number;
@@ -166,6 +349,9 @@ export class WindowsSpeechToText implements SpeechToText {
   constructor(options: WindowsSttOptions = {}) {
     this.executable = options.executable ?? POWERSHELL;
     this.args = options.args ?? DEFAULT_ARGS;
+    // A test that overrides the program overrides it for both modes: the
+    // stand-in child decides its behaviour from its own arguments.
+    this.wakeArgs = options.args ?? WAKE_ARGS;
     this.platform = options.platform ?? process.platform;
     this.warmupTimeoutMs = options.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS;
     this.transcriptionTimeoutMs = options.transcriptionTimeoutMs ?? LISTENING_LIMITS.transcriptionTimeoutMs;
@@ -184,7 +370,7 @@ export class WindowsSpeechToText implements SpeechToText {
     return this.unavailable;
   }
 
-  start(onChunk: (chunk: TranscriptChunk) => void): Promise<SpeechToTextSession> {
+  start(onChunk: (chunk: TranscriptChunk) => void, options: SpeechToTextOptions = {}): Promise<SpeechToTextSession> {
     if (!this.isAvailable()) {
       return Promise.reject(
         new SpeechRecognitionError('UNAVAILABLE', this.unavailableReason() ?? 'Speech recognition is unavailable.'),
@@ -200,8 +386,8 @@ export class WindowsSpeechToText implements SpeechToText {
           // is a constant. There is no command line here for anything to be
           // injected into, and nothing variable reaches the child except the
           // audio on its stdin.
-          [...this.args],
-          { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
+          [...(options.mode === 'wake' ? this.wakeArgs : this.args)],
+          { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: recognizerEnvironment() },
         );
       } catch (error) {
         reject(
@@ -214,6 +400,7 @@ export class WindowsSpeechToText implements SpeechToText {
       }
 
       const session = new WindowsSttSession(child, onChunk, {
+        onDiagnostic: options.onDiagnostic ?? null,
         transcriptionTimeoutMs: this.transcriptionTimeoutMs,
         maxAudioBytes: this.maxAudioBytes,
         onUnavailable: (reason) => {
@@ -243,6 +430,7 @@ export class WindowsSpeechToText implements SpeechToText {
 }
 
 interface SessionOptions {
+  readonly onDiagnostic: ((line: string) => void) | null;
   readonly transcriptionTimeoutMs: number;
   readonly maxAudioBytes: number;
   onUnavailable(reason: string): void;
@@ -414,9 +602,14 @@ class WindowsSttSession implements SpeechToTextSession {
   /**
    * Parse the child's line protocol.
    *
-   * Three verbs, all fixed-shape: READY, AUDIO <bytes>, PHRASE <confidence>
-   * <base64>, END. Anything else is ignored rather than interpreted — the
-   * child is a subprocess, not a trusted peer.
+   * Fixed-shape verbs: READY, AUDIO <bytes>, PHRASE <confidence> <base64>,
+   * WAKE <confidence> <base64> (the wake grammar matched), NEAR <confidence>
+   * <base64> (a near-miss sound-alike matched) — both optionally followed by
+   * <startMs> <durationMs> of the matched audio — END. Wake sessions also report
+   * RECOGNIZER, GRAMMAR, FORMAT, SPEECH and REJECTED, which go to the
+   * diagnostics callback and never become transcripts. Anything else is
+   * ignored rather than interpreted — the child is a subprocess, not a trusted
+   * peer.
    */
   private onStdout(chunk: string): void {
     this.stdoutTail += chunk;
@@ -462,18 +655,77 @@ class WindowsSttSession implements SpeechToTextSession {
         continue;
       }
       if (line.startsWith('PHRASE ')) {
-        this.emitPhrase(line.slice('PHRASE '.length));
+        this.emitPhrase(line.slice('PHRASE '.length), 'dictation');
+        continue;
       }
-      // AUDIO and anything unrecognised are deliberately ignored.
+      if (line.startsWith('WAKE ')) {
+        this.emitPhrase(line.slice('WAKE '.length), 'wake-phrase');
+        continue;
+      }
+      if (line.startsWith('NEAR ')) {
+        this.emitPhrase(line.slice('NEAR '.length), 'near-miss');
+        continue;
+      }
+      this.diagnose(line);
+      // AUDIO and anything unrecognised are otherwise deliberately ignored.
     }
   }
 
-  private emitPhrase(payload: string): void {
+  /**
+   * Turn a recognizer self-report into a readable diagnostic line.
+   *
+   * Only the fixed verbs are translated, text fields are decoded from base64
+   * and bounded, and nothing arrives here unless a developer asked for
+   * diagnostics. Audio is never on this channel: the child has no verb for it.
+   */
+  private diagnose(line: string): void {
+    const report = this.options.onDiagnostic;
+    if (!report) return;
+    const decode = (encoded: string | undefined): string => {
+      if (!encoded) return '';
+      try {
+        return Buffer.from(encoded, 'base64').toString('utf8').slice(0, 160);
+      } catch {
+        return '';
+      }
+    };
+    const parts = line.split(' ');
+    switch (parts[0]) {
+      case 'RECOGNIZER':
+        report(`recognizer initialized: ${decode(parts[2])}, culture ${parts[1] ?? '?'}`);
+        return;
+      case 'GRAMMAR':
+        report(`grammar loaded: ${parts[1] ?? '?'}`);
+        return;
+      case 'FORMAT':
+        report(`audio format: ${parts[1] ?? '?'} Hz, ${parts[2] ?? '?'}-bit, ${parts[3] ?? '?'}`);
+        return;
+      case 'SPEECH':
+        report('recognizer detected speech');
+        return;
+      case 'REJECTED':
+        report(`[REJECTED] ${parts[1] ?? '?'} "${decode(parts[2])}" (below the engine's rejection threshold)`);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private emitPhrase(payload: string, source: 'wake-phrase' | 'near-miss' | 'dictation'): void {
     const space = payload.indexOf(' ');
     if (space <= 0) return;
 
     const confidence = Number.parseFloat(payload.slice(0, space));
-    const encoded = payload.slice(space + 1);
+    // "<base64>" or "<base64> <startMs> <durationMs>". Base64 has no spaces, so
+    // the fields split cleanly; timing that is not two whole numbers is dropped
+    // rather than guessed at.
+    const [encoded = '', startField, durationField] = payload.slice(space + 1).split(' ');
+    const startMs = startField === undefined ? Number.NaN : Number(startField);
+    const durationMs = durationField === undefined ? Number.NaN : Number(durationField);
+    const span =
+      Number.isInteger(startMs) && Number.isInteger(durationMs) && startMs >= 0 && durationMs > 0
+        ? { startMs, durationMs }
+        : undefined;
 
     let text: string;
     try {
@@ -487,6 +739,8 @@ class WindowsSttSession implements SpeechToTextSession {
       text,
       isFinal: true,
       confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : null,
+      source,
+      ...(span ? { span } : {}),
     });
   }
 

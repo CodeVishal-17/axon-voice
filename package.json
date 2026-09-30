@@ -2,14 +2,22 @@
   "name": "axon-voice",
   "version": "0.1.0",
   "private": true,
-  "description": "Axon Voice — a voice-first desktop AI agent.",
+  "description": "Axon Voice \u2014 a voice-first desktop AI agent.",
   "license": "UNLICENSED",
-  "engines": { "node": ">=20.19" },
-  "workspaces": ["packages/*", "apps/*"],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "dev": "npm run build --workspace @axon/core && npm run dev --workspace @axon/desktop",
     "build": "npm run build --workspace @axon/core && npm run build --workspace @axon/desktop",
-    "typecheck": "npm run typecheck --workspace @axon/core && npm run typecheck --workspace @axon/desktop",
+    "web:dev": "npm run dev --workspace @axon/web",
+    "web:build": "npm run build --workspace @axon/web",
+    "web:preview": "npm run preview --workspace @axon/web",
+    "typecheck": "npm run typecheck --workspace @axon/core && npm run typecheck --workspace @axon/desktop && npm run typecheck --workspace @axon/web",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -20,6 +28,16 @@
     "verify:voice-agent": "npm run verify:voice-agent --workspace @axon/desktop",
     "verify:desktop": "npm run verify:desktop --workspace @axon/desktop",
     "smoke:assemblyai": "npm run smoke:assemblyai --workspace @axon/desktop",
+    "preflight": "npm run preflight --workspace @axon/desktop",
+    "wake:live": "npm run wake:live --workspace @axon/desktop",
+    "wake:model": "npm run wake:model --workspace @axon/desktop",
+    "wake:calibrate": "npm run wake:calibrate --workspace @axon/desktop",
+    "voice:live": "npm run voice:live --workspace @axon/desktop",
+    "ui:shots": "npm run ui:shots --workspace @axon/desktop",
+    "verify:lifecycle": "npm run verify:lifecycle --workspace @axon/desktop",
+    "rehearse": "vitest run apps/desktop/tests/rehearsal.test.ts",
+    "attacks": "vitest run apps/desktop/tests/demo-attacks.test.ts",
+    "demo:doc": "vitest run apps/desktop/tests/demo-script.test.ts",
     "verify:persistence": "npm run verify:persistence --workspace @axon/desktop",
     "verify:all": "npm run typecheck && npm run lint && npm run test && npm run verify:tools && npm run verify:voice && npm run verify:browser && npm run verify:persistence && npm run verify:agent && npm run verify:voice-agent && npm run verify:desktop"
   },

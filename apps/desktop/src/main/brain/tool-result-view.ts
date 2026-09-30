@@ -10,7 +10,7 @@
  * safety layer: what happened, and whether trying again could ever help.
  */
 
-import { AGENT_LOOP_LIMITS } from '@axon/core';
+import { AGENT_LOOP_LIMITS, FAILURE_GUIDANCE } from '@axon/core';
 import type { JsonValue, ToolFailureKind, ToolResult } from '@axon/core';
 
 /** The JSON body handed back as a `tool_result` block's content. */
@@ -54,6 +54,24 @@ function isRetryable(kind: ToolFailureKind): boolean {
     case 'DUPLICATE_SIDE_EFFECT':
     case 'APPROVAL_MISMATCH':
       return false;
+    // The ambiguity is in the REQUEST, so the identical call would be exactly
+    // as ambiguous the second time. The remedy is a question to the user, not
+    // a retry, and marking it retryable would invite the model to try again
+    // with the same words.
+    case 'CLARIFICATION_NEEDED':
+      return false;
+    // The kinds that name what went wrong in the world. Their retryability
+    // is read from the one table both result views share — see
+    // `FAILURE_GUIDANCE` in core — so the typed brain and the voice agent
+    // cannot disagree about whether a timeout is worth one more try.
+    case 'NOT_FOUND':
+    case 'TIMEOUT':
+    case 'VERIFICATION_FAILED':
+    case 'AUTH_REQUIRED':
+    case 'UNSUPPORTED':
+    case 'WINDOW_NOT_FOUND':
+    case 'UI_NOT_ACCESSIBLE':
+      return FAILURE_GUIDANCE[kind].retryable;
     default: {
       // A new failure kind defaults to "do not retry" — the same
       // deny-by-default posture the safety layer takes.
@@ -76,6 +94,8 @@ function explain(kind: ToolFailureKind, message: string): string {
       return `${message} Use only the tools you were given.`;
     case 'INVALID_INPUT':
       return `The arguments did not match the tool's schema: ${message} Re-read the schema and correct them.`;
+    case 'CLARIFICATION_NEEDED':
+      return `${message} Ask the user this question and wait for their answer. Do not guess, and do not report this as a failure.`;
     case 'CANCELLED':
       return 'The action was cancelled because Axon is shutting down.';
     case 'EXECUTION_ERROR':
@@ -88,6 +108,18 @@ function explain(kind: ToolFailureKind, message: string): string {
       return message;
     case 'APPROVAL_MISMATCH':
       return message;
+    // What went wrong, then what to say about it. The message is the
+    // specific fact ("Spotify is not installed"); the guidance is the rule
+    // that stops it being narrated as something else — above all, as a
+    // timeout, which is what a real session called nearly every failure.
+    case 'NOT_FOUND':
+    case 'TIMEOUT':
+    case 'VERIFICATION_FAILED':
+    case 'AUTH_REQUIRED':
+    case 'UNSUPPORTED':
+    case 'WINDOW_NOT_FOUND':
+    case 'UI_NOT_ACCESSIBLE':
+      return `${message} ${FAILURE_GUIDANCE[kind].say}`;
     default:
       return message;
   }

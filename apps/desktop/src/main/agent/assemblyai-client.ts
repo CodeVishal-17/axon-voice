@@ -116,6 +116,36 @@ export interface VoiceSocketOptions {
  * reviving this one: a socket that can be resurrected is a socket whose state
  * is ambiguous, and ambiguity here means "is audio still being sent?".
  */
+/**
+ * How a closed connection should be understood.
+ *
+ * Every close used to be reported as an ORDINARY end, which meant the
+ * session's reconnect-and-resume logic was reachable only through an 'error'
+ * event — and a connection that simply drops (a laptop changing access point,
+ * a venue's wifi hiccuping) produces a close with code 1006 and often no
+ * error at all. So a two-second network blip mid-demo ended the conversation
+ * as though the user had closed it, and resumption never had a chance.
+ *
+ * The codes that mean "the connection went away, not the conversation" are
+ * reported as a retryable NETWORK failure, which the session already knows how
+ * to resume inside its bounded window. Everything else — a normal close, a
+ * going-away, a policy close from the provider — stays an ordinary end: an
+ * assistant that reconnects when the other side meant to hang up is one whose
+ * microphone state nobody can reason about.
+ *
+ * Nothing from the close REASON text is read. Only the numeric code crosses
+ * this function, for the same reason `describeSocketError` ignores provider
+ * messages.
+ */
+export function describeClose(code: number): VoiceSocketError | null {
+  // 1006: closed without a close frame — the network, not a decision.
+  // 1011-1014: server error, restart, try again later, bad gateway.
+  if (code === 1006 || (code >= 1011 && code <= 1014)) {
+    return new VoiceSocketError('NETWORK', 'The voice connection dropped.', true);
+  }
+  return null;
+}
+
 export class VoiceSocket {
   private readonly apiKey: string;
   private readonly endpoint: string;
@@ -136,6 +166,16 @@ export class VoiceSocket {
       options.connect ??
       ((url, headers): WebSocket => new WebSocket(url, { headers }));
     this.handlers = handlers;
+  }
+
+  /**
+   * Bytes accepted by `send` but not yet written to the network.
+   *
+   * For diagnostics: a number that keeps growing is audio queued behind a slow
+   * connection, which reaches the provider late and in bursts.
+   */
+  get bufferedBytes(): number {
+    return this.socket?.bufferedAmount ?? 0;
   }
 
   get open(): boolean {
@@ -210,8 +250,8 @@ export class VoiceSocket {
       });
     });
 
-    socket.on('close', () => {
-      this.fail(null);
+    socket.on('close', (code: number) => {
+      this.fail(describeClose(code));
     });
   }
 
@@ -294,6 +334,11 @@ export class VoiceSocket {
     if (!socket) return;
     try {
       socket.removeAllListeners();
+      // Closing a socket that is still CONNECTING makes `ws` emit 'error'
+      // ("closed before the connection was established") on the next tick.
+      // With no listener that is an uncaught exception in the main process —
+      // reachable by ending a session while it is still connecting.
+      socket.on('error', () => {});
       socket.close();
     } catch {
       /* already gone */

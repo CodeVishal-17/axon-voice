@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { VOICE_AGENT_ENCODING, VOICE_AGENT_LIMITS, type SpeechChunk, type ToolResult } from '@axon/core';
 import { VoiceSocket } from '../src/main/agent/assemblyai-client.js';
 import { VoiceAgentSession } from '../src/main/agent/voice-agent-session.js';
+import { TaskLedger } from '../src/main/agent/task-ledger.js';
 
 /** A stand-in provider: a real server that replays documented events. */
 interface FakeProvider {
@@ -236,9 +237,14 @@ describe('VoiceAgentSession', () => {
     options: {
       requiresApproval?: boolean;
       dispatch?: (tool: string) => ToolResult;
+      /** False: the fake provider does not send `session.ready` until a test does. */
+      autoReady?: boolean;
+      /** Diagnostics hooks, as the orchestrator wires them in a debug build. */
+      dropped?: { bytes: number; reason: string }[];
+      sent?: number[];
     } = {},
   ): Promise<Rig> {
-    const fake = await provider();
+    const fake = await provider({ autoReady: options.autoReady ?? true });
 
     const state: Rig = {
       session: null as unknown as VoiceAgentSession,
@@ -250,6 +256,9 @@ describe('VoiceAgentSession', () => {
       dispatched: [],
       closed: false,
     };
+
+    const tasks = new TaskLedger();
+    tasks.begin('do the thing', 'voice');
 
     const session = new VoiceAgentSession({
       apiKey: 'k',
@@ -273,6 +282,10 @@ describe('VoiceAgentSession', () => {
         );
       },
       willRequireApproval: () => options.requiresApproval ?? false,
+      // A task the tool calls belong to. Phase 3 made this a requirement
+      // rather than an option: a step can only be opened against an active
+      // task, which is what stops a cancelled request carrying on.
+      tasks,
       onUserTranscript: (text) => state.transcripts.user.push(text),
       onAgentTranscript: (text) => state.transcripts.agent.push(text),
       onAudioChunk: (chunk) => state.chunks.push(chunk),
@@ -281,6 +294,8 @@ describe('VoiceAgentSession', () => {
       onClosed: () => {
         state.closed = true;
       },
+      onAudioDropped: (bytes, reason) => options.dropped?.push({ bytes, reason }),
+      onAudioSent: (bytes) => options.sent?.push(bytes),
     });
 
     (state as { session: VoiceAgentSession }).session = session;
@@ -438,6 +453,8 @@ describe('VoiceAgentSession', () => {
 
   it('buffers microphone audio to the provider chunk size', async () => {
     const r = await rig();
+    // Audio only flows once the provider has said the session is ready.
+    await until(() => r.phases.includes('LISTENING'), 'session.ready');
 
     // One small frame is under the target and must not be sent on its own.
     r.session.pushAudio(new Uint8Array(64));
@@ -447,6 +464,44 @@ describe('VoiceAgentSession', () => {
     // Enough to cross 50 ms at 24 kHz 16-bit = 2400 bytes.
     r.session.pushAudio(new Uint8Array(2_400));
     await until(() => r.fake.received.some((m) => m.type === 'input.audio'), 'input.audio');
+    r.session.stop();
+  });
+
+  it('sends no microphone audio before session.ready, and reports what it dropped', async () => {
+    // AssemblyAI: "Wait for session.ready before the first chunk." Axon used to
+    // stream as soon as the socket opened, so a person's first words went out
+    // before the session's input format had been applied.
+    const dropped: { bytes: number; reason: string }[] = [];
+    const sent: number[] = [];
+    const r = await rig({ autoReady: false, dropped, sent });
+    await until(() => r.fake.received.some((m) => m.type === 'session.update'), 'session.update');
+
+    r.session.pushAudio(new Uint8Array(4_800));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(r.fake.received.some((m) => m.type === 'input.audio')).toBe(false);
+    expect(dropped).toEqual([{ bytes: 4_800, reason: 'not-ready' }]);
+    expect(sent).toEqual([]);
+
+    r.fake.send({ type: 'session.ready', session_id: 'sess-1' });
+    await until(() => r.phases.includes('LISTENING'), 'session.ready');
+    r.session.pushAudio(new Uint8Array(2_400));
+    await until(() => r.fake.received.some((m) => m.type === 'input.audio'), 'input.audio');
+    expect(sent).toEqual([2_400]);
+    r.session.stop();
+  });
+
+  it('never queues pre-ready audio to send later — stale speech is not delivered late', async () => {
+    const r = await rig({ autoReady: false });
+    await until(() => r.fake.received.some((m) => m.type === 'session.update'), 'session.update');
+    r.session.pushAudio(new Uint8Array(24_000)); // half a second, dropped
+    r.fake.send({ type: 'session.ready', session_id: 'sess-2' });
+    await until(() => r.phases.includes('LISTENING'), 'session.ready');
+    r.session.pushAudio(new Uint8Array(2_400));
+    await until(() => r.fake.received.some((m) => m.type === 'input.audio'), 'input.audio');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const audio = r.fake.received.filter((m) => m.type === 'input.audio');
+    const bytes = audio.reduce((n, m) => n + Buffer.from(String(m.audio), 'base64').byteLength, 0);
+    expect(bytes).toBe(2_400);
     r.session.stop();
   });
 
@@ -488,4 +543,50 @@ describe('VoiceAgentSession', () => {
     expect(r.phases.length).toBe(phases);
     r.session.stop();
   });
+
+  // ---------------------------------------------------------------------
+  // One reply, one message
+  // ---------------------------------------------------------------------
+
+    it('does not repeat a transcript the provider sent twice', async () => {
+      // The provider can send `transcript.agent` more than once for a single
+      // reply — a partial then a final, or a final repeated. Every one of them
+      // used to become its own event, so a user's transcript, and their stored
+      // conversation, carried each of Axon's replies twice.
+      const r = await rig();
+
+      r.fake.send({ type: 'transcript.agent', text: 'Calculator is open.' });
+      r.fake.send({ type: 'transcript.agent', text: 'Calculator is open.' });
+      await until(() => r.transcripts.agent.length > 0, 'an agent transcript');
+
+      expect(r.transcripts.agent).toEqual(['Calculator is open.']);
+    });
+
+    it('still reports a genuinely different sentence in the same reply', async () => {
+      const r = await rig();
+
+      r.fake.send({ type: 'transcript.agent', text: 'One moment.' });
+      r.fake.send({ type: 'transcript.agent', text: 'Calculator is open.' });
+      await until(() => r.transcripts.agent.length === 2, 'both transcripts');
+
+      expect(r.transcripts.agent).toEqual(['One moment.', 'Calculator is open.']);
+    });
+
+    it('lets a later reply say what the last one said', async () => {
+      // A user who asks the same thing twice gets two answers. Dedupe is scoped
+      // to the reply in flight, not to the conversation.
+      const r = await rig();
+
+      r.fake.send({ type: 'transcript.agent', text: 'Notepad is open.' });
+      await until(() => r.transcripts.agent.length === 1, 'the first transcript');
+      r.fake.send({ type: 'reply.done', status: 'completed' });
+      r.fake.send({ type: 'transcript.agent', text: 'Notepad is open.' });
+      await until(() => r.transcripts.agent.length === 2, 'the second transcript');
+
+      expect(r.transcripts.agent).toEqual(['Notepad is open.', 'Notepad is open.']);
+    });
+
+
+
 });
+

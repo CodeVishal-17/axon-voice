@@ -33,14 +33,18 @@
 import { z } from 'zod';
 import {
   BROWSING_LIMITS,
+  ClarificationRequired,
+  classifyText,
   defineTool,
   type JsonObject,
+  type NavigationStatus,
   type ObservedElement,
   type PageObservation,
   type PrecheckVerdict,
   type RegisteredTool,
   type RiskAssessment,
   type SideEffectClass,
+  type ToolExecutionContext,
   type ToolSummary,
 } from '@axon/core';
 import type { BrowserController } from '../../browser/axon-browser.js';
@@ -69,6 +73,20 @@ const urlSchema = z
 const emptySchema = z.object({});
 
 /** Where the action would happen, for the approval dialog. */
+/**
+ * "Axon wants to <act> on <host>", for an approval title.
+ *
+ * WHAT and WHERE in the one line a person actually reads — and the one Axon
+ * says out loud. `hostOf` is used rather than the URL because a full address
+ * with a path and a query is a string people skim past, which is how a dialog
+ * that technically disclosed everything ends up disclosing nothing. The full
+ * address is still in the parameters, one line below.
+ */
+function describeAct(act: string, url: string | null): string {
+  const host = url ? hostOf(url) : null;
+  return host && host !== 'that address' ? `Axon wants to ${act} on ${host}` : `Axon wants to ${act}`;
+}
+
 function contextOf(browser: BrowserController): ActionContext | null {
   const observation = browser.lastObservation();
   return observation ? { url: observation.url, title: observation.title } : null;
@@ -140,7 +158,10 @@ function requireKnownElement(browser: BrowserController, ref: string): PrecheckV
 async function resolveTarget(
   browser: BrowserController,
   ref: string,
-): Promise<{ ok: true; ref: string; remapped: boolean } | { ok: false; reason: string }> {
+): Promise<
+  | { ok: true; ref: string; remapped: boolean }
+  | { ok: false; reason: string; ambiguous?: boolean }
+> {
   if (browser.observationFresh()) return { ok: true, ref, remapped: false };
 
   const intended = browser.describeElement(ref);
@@ -167,10 +188,10 @@ async function resolveTarget(
 
   return {
     ok: false,
+    ambiguous: true,
     reason:
-      `The page changed and there are now ${matches.length} elements matching ` +
-      `"${intended.label || intended.role}", so Axon cannot tell which one you meant. ` +
-      'Read the page and pick one explicitly.',
+      `There is more than one "${intended.label || intended.role}" on the page now. ` +
+      'Which one do you mean?',
   };
 }
 
@@ -196,20 +217,147 @@ function sameElement(a: ObservedElement, b: ObservedElement): boolean {
 // browser.open / browser.navigate
 // ---------------------------------------------------------------------------
 
+/**
+ * How many times each address has failed to load, and when.
+ *
+ * WHY THE TURN BUDGET IS NOT ENOUGH.
+ *
+ * The generic repeat bound allows three identical dispatches, which is the
+ * right number for an action that might transiently fail. A navigation is not
+ * that: a site that did not load twice will not load on the third attempt
+ * inside the same conversation, and every attempt costs the full navigation
+ * budget — eighteen seconds of a person waiting in silence, three times over,
+ * for an answer Axon already had after the first.
+ *
+ * So navigations get a tighter, address-keyed bound of their own, enforced in
+ * `precheck` — which means it is answered before the risk policy and before
+ * anybody is asked anything, and the refusal is non-retryable so the model is
+ * told to stop rather than encouraged to vary the arguments until something
+ * gets through.
+ *
+ * Entries expire, so this is a bound on a burst rather than a permanent
+ * blocklist: a site that was down five minutes ago may be up now, and a user
+ * who asks again deserves an attempt.
+ */
+class NavigationAttempts {
+  private readonly failures = new Map<string, { count: number; at: number }>();
+  private readonly now: () => number;
+  private readonly windowMs: number;
+
+  constructor(now: () => number = () => Date.now(), windowMs = 120_000) {
+    this.now = now;
+    this.windowMs = windowMs;
+  }
+
+  /** Failures recorded for `url` inside the window. Expired entries are dropped. */
+  failureCount(url: string): number {
+    const entry = this.failures.get(url);
+    if (!entry) return 0;
+    if (this.now() - entry.at > this.windowMs) {
+      this.failures.delete(url);
+      return 0;
+    }
+    return entry.count;
+  }
+
+  recordFailure(url: string): void {
+    const count = this.failureCount(url) + 1;
+    this.failures.set(url, { count, at: this.now() });
+  }
+
+  /** A load that worked clears the history: the address is evidently fine. */
+  recordSuccess(url: string): void {
+    this.failures.delete(url);
+  }
+}
+
+export interface NavigationToolOptions {
+  /** Injected in tests so the attempt window and the deadline are pinned. */
+  readonly now?: () => number;
+  /** Overridden in tests. Defaults to the shared contract's budget. */
+  readonly budgetMs?: number;
+}
+
 function navigationTool(
   browser: BrowserController,
   name: 'browser.open' | 'browser.navigate',
   title: string,
   description: string,
+  options: NavigationToolOptions = {},
 ): RegisteredTool {
   const inputSchema = z.object({ url: urlSchema });
   type Input = z.infer<typeof inputSchema>;
+
+  const now = options.now ?? ((): number => Date.now());
+  const budgetMs = options.budgetMs ?? BROWSING_LIMITS.navigationBudgetMs;
+  const attempts = new NavigationAttempts(now);
+
+  /**
+   * What Axon knows once it has stopped waiting.
+   *
+   * ONE bounded look, and then an honest answer — which may be "I do not know
+   * yet". There is no retry of the navigation anywhere in here, and no branch
+   * that reports success without having read the page.
+   */
+  const afterDeadline = async (ctx: ToolExecutionContext, requested: string): Promise<JsonObject> => {
+    const seconds = Math.round(budgetMs / 1000);
+    const landed = await verifyLanded(browser, requested, BROWSING_LIMITS.navigationVerifyMs);
+
+    if (landed) {
+      // The page is on the requested host. Slow is not failed, and Axon has
+      // now READ the page rather than assumed anything about it.
+      attempts.recordSuccess(requested);
+      ctx.observe(`${hostOf(requested)} took longer than ${seconds}s, but the page is loaded`, { url: landed.url });
+      return {
+        ...toObservationOutput(landed),
+        ...navigationOutcome('SUCCESS', requested, landed.url),
+        note:
+          `Loading took longer than ${seconds} seconds, so Axon stopped waiting and read the page instead. ` +
+          'It is on the requested site. Report what the page shows.',
+      };
+    }
+
+    // Axon could not establish that it is on the requested site, and it could
+    // not establish that it is not. That is STILL_LOADING, and saying so is
+    // the whole point of having a third answer.
+    attempts.recordFailure(requested);
+    const current = browser.lastObservation();
+    ctx.observe(`${hostOf(requested)} did not finish loading within ${seconds}s`, { url: requested });
+    return {
+      ...navigationOutcome('STILL_LOADING', requested, current?.url ?? null),
+      note:
+        `${hostOf(requested)} had not loaded after ${seconds} seconds and Axon could not confirm the page. ` +
+        'Do NOT say it opened, and do not call this again for the same address — tell the user it has not ' +
+        'loaded yet and let them decide.',
+    };
+  };
 
   return defineTool<Input, JsonObject>({
     name,
     title,
     description,
     inputSchema,
+
+    /**
+     * Refuse a third go at an address that has already failed twice.
+     *
+     * A precheck can only ever refuse, which is exactly the right shape: this
+     * adds a bound and can grant nothing. `retryable: false` because re-trying
+     * is precisely what is being refused — the model's remedy is to tell the
+     * user the site did not load, not to call again.
+     */
+    precheck(input): PrecheckVerdict {
+      const normalized = classifyUrl(input.url).normalized;
+      if (!normalized) return { ok: true };
+      if (attempts.failureCount(normalized) < BROWSING_LIMITS.maxNavigationAttemptsPerUrl) return { ok: true };
+      return {
+        ok: false,
+        reason:
+          `Axon has already tried ${hostOf(normalized)} ${BROWSING_LIMITS.maxNavigationAttemptsPerUrl} times ` +
+          'in the last few minutes and it did not load. Tell the user it did not load and stop; do not try again.',
+        retryable: false,
+      };
+    },
 
     // Risk comes entirely from the URL: a public https page is SAFE to read,
     // an unusual port is worth asking about, and a private or non-web address
@@ -219,9 +367,14 @@ function navigationTool(
 
     summarize(input): ToolSummary {
       const verdict = classifyUrl(input.url);
+      const address = verdict.normalized ?? input.url;
       return {
-        title: 'Axon wants to open a web page',
-        parameters: [{ label: 'Address', value: verdict.normalized ?? input.url }],
+        // WHAT and WHERE, in the title, because the title is the line a person
+        // reads and the line Axon says out loud. "Axon wants to open a web
+        // page" answers neither question, and a dialog that does not say where
+        // something is going is a dialog nobody can answer responsibly.
+        title: `Axon wants to open ${hostOf(address)}`,
+        parameters: [{ label: 'Address', value: address }],
       };
     },
 
@@ -233,12 +386,32 @@ function navigationTool(
       if (!verdict.normalized) {
         throw new Error(`Refusing to open that address: ${verdict.reason}`);
       }
+      const requested = verdict.normalized;
 
       let observation: PageObservation;
       try {
-        observation =
-          name === 'browser.open' ? await browser.open(verdict.normalized) : await browser.navigate(verdict.normalized);
+        // Started INSIDE the try. A controller may report a refusal by
+        // throwing synchronously rather than by rejecting, and starting the
+        // navigation outside would let that escape past the verification below
+        // — which is the one path that stops Axon announcing a failure for a
+        // page that is on screen.
+        //
+        // THE TOOL'S OWN DEADLINE.
+        //
+        // The mechanism below already bounds `loadURL`, but not the whole
+        // call: a slow site keeps firing load events, the settle waits again,
+        // and a live test watched one `browser.open` stay in flight for
+        // minutes. This stops WAITING at the deadline. It does not stop the
+        // navigation — the page may well arrive, and abandoning a nearly-
+        // finished load would be its own kind of wrong — it stops the tool
+        // pretending it has nothing to say.
+        observation = await withDeadline(
+          name === 'browser.open' ? browser.open(requested) : browser.navigate(requested),
+          budgetMs,
+        );
       } catch (error) {
+        if (error instanceof NavigationDeadline) return await afterDeadline(ctx, requested);
+
         // VERIFY BEFORE DECLARING FAILURE.
         //
         // A navigation can report an error and still have loaded the page:
@@ -253,45 +426,122 @@ function navigationTool(
         // from Axon's own reading, and says exactly what it established.
         //
         // Bounded: ONE read, no retry of the navigation, and any failure of
-        // the check itself re-throws the original error.
-        const landed = await verifyLanded(browser, verdict.normalized);
-        if (!landed) throw error;
+        // the check itself records the failure and re-throws.
+        const landed = await verifyLanded(browser, requested);
+        if (!landed) {
+          attempts.recordFailure(requested);
+          throw error;
+        }
 
+        attempts.recordSuccess(requested);
         ctx.observe(`Opened ${describePage(landed)} (the navigation reported an error, but the page is loaded)`, {
           url: landed.url,
         });
         return {
           ...toObservationOutput(landed),
+          ...navigationOutcome('SUCCESS', requested, landed.url),
           note:
             'The navigation reported an error, but Axon read the page afterwards and is on the requested site. ' +
             'Treat the page as loaded, and say so plainly if it looks incomplete.',
         };
       }
 
+      attempts.recordSuccess(requested);
       ctx.observe(`Opened ${describePage(observation)}`, { url: observation.url });
-      return toObservationOutput(observation);
+      return { ...toObservationOutput(observation), ...navigationOutcome('SUCCESS', requested, observation.url) };
     },
   });
 }
 
-export function createBrowserOpenTool(browser: BrowserController): RegisteredTool {
+export function createBrowserOpenTool(browser: BrowserController, options?: NavigationToolOptions): RegisteredTool {
   return navigationTool(
     browser,
     'browser.open',
     'Open a web page',
     'Open the Axon browser window and go to an http or https address. The window is visible to the user. ' +
-      'Returns the page URL, title, visible text and the interactive elements on it.',
+      'Returns the page URL, title, visible text and the interactive elements on it, plus a navigation status ' +
+      'saying whether the page actually loaded. Never say a page opened unless that status is SUCCESS.',
+    options,
   );
 }
 
-export function createBrowserNavigateTool(browser: BrowserController): RegisteredTool {
+export function createBrowserNavigateTool(browser: BrowserController, options?: NavigationToolOptions): RegisteredTool {
   return navigationTool(
     browser,
     'browser.navigate',
     'Go to a web page',
     'Navigate the already-open Axon browser to another http or https address. ' +
-      'Returns the same page description as browser.read.',
+      'Returns the same page description as browser.read, plus a navigation status.',
+    options,
   );
+}
+
+/** The navigation verdict, shaped for the model and for the timeline. */
+function navigationOutcome(status: NavigationStatus, requested: string, landedOn: string | null): JsonObject {
+  return {
+    navigation: {
+      status,
+      requested,
+      landedOn,
+      // Spelled out because a status code alone gets read as a formality. The
+      // sentence is what a model about to speak actually acts on.
+      meaning:
+        status === 'SUCCESS'
+          ? 'Axon read the page and is on the requested site.'
+          : status === 'FAILED'
+            ? 'The navigation failed and Axon is not on the requested site.'
+            : 'Axon stopped waiting and could not confirm the page. Do not claim it opened.',
+    },
+  };
+}
+
+/**
+ * The host of a URL, for a message.
+ *
+ * Never the path and never the query string, which can carry tokens and
+ * session identifiers. What a person needs to hear is "GitHub did not load",
+ * not the full address with its parameters.
+ */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return 'that address';
+  }
+}
+
+/** Raised when the tool's own deadline passes. Distinct from any browser error. */
+class NavigationDeadline extends Error {
+  constructor() {
+    super('The navigation took longer than the tool allows.');
+    this.name = 'NavigationDeadline';
+  }
+}
+
+/**
+ * Stop waiting for `promise` after `ms`.
+ *
+ * The abandoned promise is NOT cancelled — the page may still be arriving, and
+ * killing a nearly-finished load to satisfy a deadline would be worse than
+ * waiting. It is given a no-op catch instead, because an abandoned rejection
+ * in the main process is an unhandled rejection, and an unhandled rejection is
+ * how an Electron app dies.
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new NavigationDeadline()), ms);
+    if (typeof timer.unref === 'function') timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +625,7 @@ export function createBrowserClickTool(browser: BrowserController): RegisteredTo
       const element = browser.describeElement(input.ref);
       const context = contextOf(browser);
       return {
-        title: element ? `Axon wants to click "${element.label}"` : 'Axon wants to click something on the page',
+        title: describeAct(element ? `click "${element.label}"` : 'click something on the page', context?.url ?? null),
         parameters: [
           ...(context ? [{ label: 'Page', value: context.title || context.url }] : []),
           ...(context ? [{ label: 'Address', value: context.url }] : []),
@@ -393,7 +643,9 @@ export function createBrowserClickTool(browser: BrowserController): RegisteredTo
       // element with the identical risk-relevant identity is found in a fresh
       // reading, or the call fails and says why.
       const target = await resolveTarget(browser, input.ref);
-      if (!target.ok) throw new Error(target.reason);
+      // ASK, DO NOT GUESS. An element that now matches two candidates is a
+      // question for the user, not a failure to report.
+      if (!target.ok) throw target.ambiguous ? new ClarificationRequired(target.reason) : new Error(target.reason);
       if (target.remapped) {
         ctx.observe(`The page changed; found "${element?.label ?? input.ref}" again and used the current reference`, {
           from: input.ref,
@@ -448,7 +700,13 @@ export function createBrowserTypeTool(browser: BrowserController): RegisteredToo
     precheck: (input): PrecheckVerdict => requireKnownElement(browser, input.ref),
 
     resolveRisk(input): RiskAssessment {
-      return typeRisk(browser.describeElement(input.ref), input.submit, contextOf(browser));
+      // The text's CLASS reaches the risk layer; the text itself does not.
+      return typeRisk(
+        browser.describeElement(input.ref),
+        input.submit,
+        contextOf(browser),
+        classifyText(input.text).sensitivity,
+      );
     },
 
     // Filling a visible field sends nothing and may be redone freely.
@@ -462,7 +720,10 @@ export function createBrowserTypeTool(browser: BrowserController): RegisteredToo
       return {
         // The summary names the content, because "allow browser action?" is
         // not a question anybody can answer responsibly.
-        title: input.submit ? 'Axon wants to submit this text' : 'Axon wants to fill in a field',
+        title: describeAct(
+          input.submit ? 'submit this text' : element ? `fill in "${element.label}"` : 'fill in a field',
+          context?.url ?? null,
+        ),
         parameters: [
           ...(context ? [{ label: 'Page', value: context.title || context.url }] : []),
           ...(context ? [{ label: 'Address', value: context.url }] : []),
@@ -480,9 +741,18 @@ export function createBrowserTypeTool(browser: BrowserController): RegisteredToo
       if (element?.sensitive) {
         throw new Error('Refusing to type into a credential or payment field.');
       }
+      // And of credential-shaped TEXT, whatever field it was headed for. The
+      // risk policy refuses this too; this is the layer that has to hold
+      // whatever route reached it. The refusal never echoes the text.
+      if (classifyText(input.text).sensitivity === 'SECRET') {
+        throw new Error(
+          'Refusing to type that: it looks like a password, key, token or one-time code. ' +
+            'Ask the user to type it themselves.',
+        );
+      }
 
       const target = await resolveTarget(browser, input.ref);
-      if (!target.ok) throw new Error(target.reason);
+      if (!target.ok) throw target.ambiguous ? new ClarificationRequired(target.reason) : new Error(target.reason);
       if (target.remapped) {
         ctx.observe(`The page changed; found "${element?.label ?? input.ref}" again and used the current reference`, {
           from: input.ref,
@@ -640,10 +910,21 @@ const CONTROL_CHARACTERS = new RegExp(
  * The HOST is compared, not the full URL: sites redirect to a canonical path,
  * add a locale, or append tracking parameters, and none of those mean the
  * navigation failed. A different host does.
+ *
+ * BOUNDED, when a caller says so. The deadline path calls this after it has
+ * already decided the navigation is taking too long, and a check that could
+ * itself hang for the page script's full timeout would reintroduce exactly the
+ * unbounded wait the deadline just ended. A check that does not finish has
+ * established nothing, which is the same answer as a host mismatch: null.
  */
-async function verifyLanded(browser: BrowserController, requested: string): Promise<PageObservation | null> {
+async function verifyLanded(
+  browser: BrowserController,
+  requested: string,
+  timeoutMs?: number,
+): Promise<PageObservation | null> {
   try {
-    const observation = await browser.read();
+    const read = browser.read();
+    const observation = timeoutMs === undefined ? await read : await withDeadline(read, timeoutMs);
     if (!observation.url) return null;
     return new URL(observation.url).host === new URL(requested).host ? observation : null;
   } catch {

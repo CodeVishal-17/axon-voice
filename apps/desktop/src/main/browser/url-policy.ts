@@ -273,6 +273,21 @@ export function navigationRisk(raw: unknown): RiskAssessment {
 }
 
 /**
+ * "youtube.com" as a person says it, made into the address they meant:
+ * `https://youtube.com`. ONLY a bare hostname (and optional path) gets the
+ * scheme; anything with a scheme of its own — `javascript:`, `file:`,
+ * `http:` — is returned untouched, so it is classified, and refused, exactly
+ * as it was written. This never makes an address acceptable; `classifyUrl`
+ * still decides.
+ */
+export function assumeHttps(raw: string): string {
+  const trimmed = raw.trim();
+  return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}(?:[/?#].*)?$/i.test(trimmed)
+    ? `https://${trimmed}`
+    : trimmed;
+}
+
+/**
  * Whether a navigation may proceed at all.
  *
  * Used by the browser window itself, on every navigation and redirect it is

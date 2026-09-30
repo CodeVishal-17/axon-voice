@@ -14,6 +14,7 @@
  */
 
 import type { AxonState } from '@axon/core';
+import { STATE_RGB } from '../../state/state-colors.js';
 
 export type Rgb = readonly [number, number, number];
 
@@ -47,6 +48,11 @@ export interface OrbVisual {
   readonly unrest: number;
   /** Overall brightness multiplier. */
   readonly luminance: number;
+  /**
+   * A bright arc travelling around the orb. Only EXECUTING uses it: forward,
+   * directional motion that reads as "doing" rather than "thinking".
+   */
+  readonly orbit: number;
 }
 
 const COOL_CORE: Rgb = [232, 240, 252];
@@ -55,7 +61,7 @@ const WARM_CORE: Rgb = [255, 243, 224];
 export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze({
   /** Asleep but alive. Almost nothing moves; the breath is the only signal. */
   IDLE: {
-    accent: [124, 140, 168],
+    accent: STATE_RGB.IDLE,
     core: COOL_CORE,
     radius: 0.72,
     breathAmplitude: 0.022,
@@ -71,11 +77,12 @@ export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze
     hold: 0,
     unrest: 0,
     luminance: 0.72,
+    orbit: 0,
   },
 
   /** Open and attentive. Rings travel outward; amplitude pushes them further. */
   LISTENING: {
-    accent: [99, 164, 255],
+    accent: STATE_RGB.LISTENING,
     core: COOL_CORE,
     radius: 0.74,
     breathAmplitude: 0.03,
@@ -91,11 +98,12 @@ export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze
     hold: 0,
     unrest: 0,
     luminance: 1,
+    orbit: 0,
   },
 
   /** Interior motion, still surface. Reasoning looks like circulation. */
   THINKING: {
-    accent: [139, 140, 255],
+    accent: STATE_RGB.THINKING,
     core: COOL_CORE,
     radius: 0.71,
     breathAmplitude: 0.014,
@@ -111,12 +119,13 @@ export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze
     hold: 0,
     unrest: 0,
     luminance: 0.9,
+    orbit: 0,
   },
 
   /** Directed and quick. The flow tightens and speeds up; one ring pushes out
    *  per action, so the motion reads as progress rather than as thought. */
   EXECUTING: {
-    accent: [79, 209, 197],
+    accent: STATE_RGB.EXECUTING,
     core: COOL_CORE,
     radius: 0.69,
     breathAmplitude: 0.01,
@@ -132,12 +141,13 @@ export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze
     hold: 0,
     unrest: 0,
     luminance: 1.05,
+    orbit: 1,
   },
 
   /** The edge of the core becomes the waveform. Not bars — a deformed sphere,
    *  so the orb is speaking rather than hosting a visualiser. */
   SPEAKING: {
-    accent: [127, 217, 255],
+    accent: STATE_RGB.SPEAKING,
     core: COOL_CORE,
     radius: 0.7,
     breathAmplitude: 0.012,
@@ -153,12 +163,13 @@ export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze
     hold: 0,
     unrest: 0,
     luminance: 1,
+    orbit: 0,
   },
 
   /** Stopped. The breath is gone, one ring hangs at a fixed radius and pulses
    *  in place, and the core dims. Nothing advances — that is the message. */
   WAITING_FOR_APPROVAL: {
-    accent: [224, 163, 86],
+    accent: STATE_RGB.WAITING_FOR_APPROVAL,
     core: WARM_CORE,
     radius: 0.66,
     breathAmplitude: 0,
@@ -174,12 +185,13 @@ export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze
     hold: 1,
     unrest: 0,
     luminance: 0.82,
+    orbit: 0,
   },
 
   /** Destabilised. Slight positional unrest and a broken rim; still restrained,
    *  because an alarm the user cannot switch off is not information. */
   ERROR: {
-    accent: [224, 87, 91],
+    accent: STATE_RGB.ERROR,
     core: [255, 226, 226],
     radius: 0.68,
     breathAmplitude: 0.008,
@@ -195,6 +207,7 @@ export const ORB_VISUALS: Readonly<Record<AxonState, OrbVisual>> = Object.freeze
     hold: 0.35,
     unrest: 1,
     luminance: 0.88,
+    orbit: 0,
   },
 });
 
@@ -236,5 +249,6 @@ export function easeVisual(current: OrbVisual, target: OrbVisual, t: number): Or
     hold: lerp(current.hold, target.hold, t),
     unrest: lerp(current.unrest, target.unrest, t),
     luminance: lerp(current.luminance, target.luminance, t),
+    orbit: lerp(current.orbit, target.orbit, t),
   };
 }

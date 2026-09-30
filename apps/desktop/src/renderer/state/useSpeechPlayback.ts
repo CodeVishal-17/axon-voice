@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { SpeechDelivery } from '@axon/core';
 import { SpeechPlayer } from '../audio/speech-player.js';
 import { PcmStreamPlayer } from '../audio/pcm-stream-player.js';
+import { PlaybackTracker } from '../audio/playback-diagnostics.js';
 import type { AmplitudeSource } from '../components/orb/amplitude.js';
 import { SmoothedAmplitudeSource } from '../components/orb/amplitude.js';
 
@@ -81,16 +82,25 @@ export function useSpeechPlayback(): SpeechPlayback {
      * the synthesiser's watchdog, and reporting against an id it never issued
      * would be noise main has to reject.
      */
+    // The last two hops of reply audio — did this window receive it, and did
+    // it play? — reported as counts. See `playback-diagnostics.ts`.
+    const tracker = new PlaybackTracker((report) => {
+      bridge.reportPlaybackDiagnostics(report);
+    });
+
     const stream = new PcmStreamPlayer({
-      onStarted: () => {
+      onStarted: (speechId) => {
         setPlaying(true);
+        tracker.started(speechId);
       },
-      onEnded: () => {
+      onEnded: (speechId) => {
         setPlaying(false);
+        tracker.ended(speechId);
       },
-      onFailed: (_speechId, reason) => {
+      onFailed: (speechId, reason) => {
         setPlaying(false);
         console.warn('[speech:stream]', reason);
+        tracker.failed(speechId, reason);
       },
       onAmplitude: (source) => {
         setAmplitude(source ? new SmoothedAmplitudeSource(source, 0.04, 0.18) : null);
@@ -105,6 +115,7 @@ export function useSpeechPlayback(): SpeechPlayback {
       void player.play(delivery.speechId, delivery.bytes);
     });
     const offChunk = bridge.onSpeechChunk((chunk) => {
+      tracker.chunk(chunk.speechId, chunk.pcm.byteLength, chunk.final);
       player.stop();
       stream.push(chunk.speechId, chunk.pcm, chunk.sampleRate, chunk.final);
     });

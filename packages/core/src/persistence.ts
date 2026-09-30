@@ -264,6 +264,20 @@ export interface ContextMemory {
   readonly value: string;
 }
 
+/**
+ * Approved memories as prompt lines — ONE rendering for every prompt.
+ *
+ * One line per memory rather than prose, so a value containing a colon or a
+ * newline cannot restructure the prompt around it. Shared by the typed brain
+ * and the voice agent, so the two cannot present what Axon remembers
+ * differently: the voice path used to receive none of it at all, and a
+ * restarted voice conversation could not answer "what's my name?" from a fact
+ * the user had explicitly asked it to keep.
+ */
+export function renderMemoryLines(memories: readonly ContextMemory[]): readonly string[] {
+  return memories.map((memory) => `- ${memory.category}: ${memory.key} — ${memory.value}`);
+}
+
 /** Outcome of a settings change. Refusal is a normal answer. */
 export interface SettingsUpdateResult {
   readonly accepted: boolean;

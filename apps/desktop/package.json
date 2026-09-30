@@ -16,13 +16,22 @@
     "verify:voice-agent": "electron-vite build && electron scripts/verify-voice-agent.cjs",
     "verify:desktop": "electron-vite build && electron scripts/verify-desktop.cjs",
     "smoke:assemblyai": "electron-vite build && electron scripts/smoke-assemblyai.cjs",
-    "verify:persistence": "electron-vite build && electron scripts/verify-persistence.cjs"
+    "preflight": "electron-vite build && electron scripts/preflight.cjs",
+    "wake:live": "electron-vite build && electron scripts/wake-live.cjs",
+    "ui:shots": "electron-vite build && electron scripts/ui-shots.cjs",
+    "verify:lifecycle": "electron-vite build && electron scripts/verify-lifecycle.cjs",
+    "verify:persistence": "electron-vite build && electron scripts/verify-persistence.cjs",
+    "wake:model": "electron-vite build && node scripts/fetch-wake-model.cjs",
+    "wake:calibrate": "electron-vite build && electron scripts/wake-calibrate.cjs",
+    "voice:live": "electron-vite build && electron scripts/voice-live.cjs",
+    "compat:probe": "electron-vite build && electron scripts/compat-probe.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.123.0",
     "@axon/core": "*",
     "ws": "^8.21.3",
-    "zod": "^4.0.0"
+    "zod": "^4.0.0",
+    "sherpa-onnx-node": "^1.13.8"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

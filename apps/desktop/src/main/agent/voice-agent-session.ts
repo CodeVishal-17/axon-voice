@@ -31,8 +31,10 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  describeProgress,
   VOICE_AGENT_ENCODING,
   VOICE_AGENT_LIMITS,
+  type ContextMemory,
   type JsonValue,
   type SpeechChunk,
   type ToolCall,
@@ -42,13 +44,21 @@ import {
 } from '@axon/core';
 import { VoiceSocket, describeSocketError, type VoiceSocketError } from './assemblyai-client.js';
 import { buildAgentSystemPrompt, buildAgentTools } from './agent-tool-surface.js';
+import type { TaskLedger } from './task-ledger.js';
 import { ToolBridge } from './tool-bridge.js';
+import { ReplyLedger, classifyReplyAudio, type ReplyAudioEvent, type ReplySummary } from './reply-audio.js';
 
 export interface VoiceAgentSessionOptions {
   readonly apiKey: string;
   readonly tools: readonly ToolSchema[];
   readonly platform: string;
   readonly workspaceRoot: string;
+  /** Approved memories to put in the system prompt. See `VoiceAgentWiring`. */
+  readonly memories?: readonly ContextMemory[];
+  /** Diagnostics: each `reply.audio` message, classified. Never the audio. */
+  readonly onReplyAudio?: (event: ReplyAudioEvent) => void;
+  /** Diagnostics: each reply, summarised when it ends. Never the words. */
+  readonly onReplySummary?: (summary: ReplySummary) => void;
   /** Injected so the protocol is testable against a local fake server. */
   readonly createSocket?: (handlers: {
     onMessage(message: Record<string, unknown>): void;
@@ -60,6 +70,17 @@ export interface VoiceAgentSessionOptions {
   // --- outward wiring, all supplied by the orchestrator ------------------
   dispatch(call: ToolCall): Promise<ToolResult>;
   willRequireApproval(tool: string, input: JsonValue): boolean;
+  /** One line describing a pending approval, so the agent can say what it is. */
+  describeApproval?(tool: string, input: JsonValue): string | null;
+  /**
+   * What Axon is currently doing.
+   *
+   * Owned by the orchestrator, because cancellation is an orchestrator
+   * concern — it has to reach an abort signal, a browser and a microphone,
+   * none of which this module can see. The session only reads it, through the
+   * bridge, to decide whether a finished result is still wanted.
+   */
+  readonly tasks: TaskLedger;
   /** The user said something. Becomes USER_MESSAGE. */
   onUserTranscript(text: string): void;
   /** The agent said something. Becomes ASSISTANT_MESSAGE. */
@@ -72,6 +93,14 @@ export interface VoiceAgentSessionOptions {
   onNotice(summary: string): void;
   /** The session ended. `error` is null for an ordinary close. */
   onClosed(error: VoiceSocketError | null): void;
+  /**
+   * Developer diagnostics, all optional: bytes of microphone audio sent to the
+   * provider, audio dropped and why, and the provider's partial transcript.
+   * Numbers and the user's own words for the developer console — never audio.
+   */
+  onAudioSent?(bytes: number, bufferedBytes: number): void;
+  onAudioDropped?(bytes: number, reason: 'not-ready' | 'no-socket'): void;
+  onUserTranscriptDelta?(text: string): void;
 }
 
 export class VoiceAgentSession {
@@ -85,11 +114,33 @@ export class VoiceAgentSession {
 
   /** The provider's session id, for resumption. Never leaves main. */
   private providerSessionId: string | null = null;
+  /**
+   * True between the provider's `session.ready` and the socket closing.
+   *
+   * AssemblyAI's protocol is explicit: send `session.update`, then WAIT for
+   * `session.ready` before the first `input.audio`. Axon used to stream as soon
+   * as the WebSocket was open — so the first words a person said went out
+   * before the session's audio format had been applied. Audio before ready is
+   * now dropped and counted, never queued: queuing would deliver stale speech
+   * late, and the orb does not say "Listening" until this is true.
+   */
+  private providerReady = false;
   private reconnectAttempts = 0;
 
   /** The utterance currently being streamed to the speakers. */
   private speechId: string | null = null;
+
+  /**
+   * The last agent transcript in the reply currently in flight.
+   *
+   * Held so one spoken reply becomes one ASSISTANT_MESSAGE, however many
+   * `transcript.agent` messages the provider sends for it. Cleared on
+   * `reply.done`.
+   */
+  private lastAgentTranscript: string | null = null;
   private chunkSequence = 0;
+  /** Counts for the reply in flight. See `reply-audio.ts`. */
+  private readonly replies = new ReplyLedger(VOICE_AGENT_LIMITS.sampleRate, () => this.now().getTime());
 
   private startedAt = 0;
   private lastActivityAt = 0;
@@ -116,8 +167,18 @@ export class VoiceAgentSession {
       tools: options.tools,
       newCallId: options.newCallId ?? ((): string => randomUUID()),
       willRequireApproval: options.willRequireApproval,
+      ...(options.describeApproval ? { describeApproval: options.describeApproval } : {}),
+      tasks: options.tasks,
       onDeferredOutcome: (summary) => {
         this.speakOutcome(summary);
+      },
+      // A result the flush went without. The turn has ended, so this is not a
+      // mid-turn `tool.result` — it is the result for a turn that closed while
+      // the tool was still running, and sending it is what stops the agent's
+      // picture of the world diverging from what actually happened.
+      onLateResult: (late) => {
+        if (!this.active || !this.socket?.open) return;
+        this.socket.send({ type: 'tool.result', call_id: late.callId, result: late.result });
       },
       onNotice: options.onNotice,
     });
@@ -157,7 +218,15 @@ export class VoiceAgentSession {
    * is retained past the flush.
    */
   pushAudio(pcm: Uint8Array): void {
-    if (!this.active || !this.socket?.open) return;
+    if (!this.active) return;
+    if (!this.socket?.open) {
+      this.options.onAudioDropped?.(pcm.byteLength, 'no-socket');
+      return;
+    }
+    if (!this.providerReady) {
+      this.options.onAudioDropped?.(pcm.byteLength, 'not-ready');
+      return;
+    }
 
     this.outbound.push(pcm);
     this.outboundBytes += pcm.byteLength;
@@ -169,7 +238,7 @@ export class VoiceAgentSession {
     const chunk = concat(this.outbound, this.outboundBytes);
     this.outbound = [];
     this.outboundBytes = 0;
-    this.socket.sendAudio(chunk);
+    if (this.socket.sendAudio(chunk)) this.options.onAudioSent?.(chunk.byteLength, this.socket.bufferedBytes ?? 0);
   }
 
   /** End the conversation. Idempotent. */
@@ -184,6 +253,7 @@ export class VoiceAgentSession {
 
     this.bridge.close();
     this.finishSpeech();
+    this.summariseReply('session-ended');
 
     const socket = this.socket;
     this.socket = null;
@@ -218,6 +288,10 @@ export class VoiceAgentSession {
       );
 
     this.socket = socket;
+    // A new connection, or a resumed one, is not ready until it says so.
+    this.providerReady = false;
+    this.outbound = [];
+    this.outboundBytes = 0;
     await socket.open_();
 
     // Resume where possible, so a dropped connection does not lose the
@@ -233,8 +307,8 @@ export class VoiceAgentSession {
         system_prompt: buildAgentSystemPrompt({
           tools: this.options.tools,
           platform: this.options.platform,
-          now: this.now().toISOString(),
           workspaceRoot: this.options.workspaceRoot,
+          memories: this.options.memories ?? [],
         }),
         input: { format: { encoding: VOICE_AGENT_ENCODING, sample_rate: VOICE_AGENT_LIMITS.sampleRate } },
         output: { format: { encoding: VOICE_AGENT_ENCODING, sample_rate: VOICE_AGENT_LIMITS.sampleRate } },
@@ -257,6 +331,7 @@ export class VoiceAgentSession {
   private onSocketClosed(error: VoiceSocketError | null): void {
     if (this.closed) return;
     this.socket = null;
+    this.providerReady = false;
     this.finishSpeech();
 
     const elapsed = this.now().getTime() - this.lastActivityAt;
@@ -305,6 +380,7 @@ export class VoiceAgentSession {
 
     switch (type) {
       case 'session.ready': {
+        this.providerReady = true;
         this.providerSessionId = str(message.session_id, 128) || null;
         this.reconnectAttempts = 0;
         this.setPhase('LISTENING', 'Listening');
@@ -328,9 +404,15 @@ export class VoiceAgentSession {
       }
 
       case 'transcript.user.delta':
-        // Partial text. Deliberately dropped: a transcript that is still being
-        // revised has no business in an append-only event stream, and the
-        // final one arrives a moment later.
+        // Partial text. Deliberately kept out of the event stream: a transcript
+        // that is still being revised has no business in an append-only log,
+        // and the final one arrives a moment later. It goes only to the
+        // developer diagnostics hook, which is absent unless voice debugging
+        // is on in a development build.
+        if (this.options.onUserTranscriptDelta) {
+          const text = str(message.text, VOICE_AGENT_LIMITS.maxTranscriptCharacters).trim();
+          if (text !== '') this.options.onUserTranscriptDelta(text);
+        }
         return;
 
       case 'transcript.user': {
@@ -340,7 +422,7 @@ export class VoiceAgentSession {
       }
 
       case 'reply.started': {
-        this.beginSpeech();
+        this.replies.begin(this.beginSpeech());
         this.setPhase('SPEAKING', 'Speaking');
         return;
       }
@@ -352,7 +434,30 @@ export class VoiceAgentSession {
 
       case 'transcript.agent': {
         const text = str(message.text, VOICE_AGENT_LIMITS.maxTranscriptCharacters).trim();
-        if (text !== '') this.options.onAgentTranscript(text);
+        if (text === '') return;
+
+        // THE SAME SENTENCE, SAID ONCE.
+        //
+        // The provider can send `transcript.agent` more than once for a single
+        // spoken reply — a partial followed by a final, or a final repeated —
+        // and every one of them used to become its own ASSISTANT_MESSAGE. The
+        // user then saw their transcript, and their stored conversation, carry
+        // each of Axon's replies twice.
+        //
+        // A live harness found it by accident and misread it as Axon speaking
+        // twice, which is worth recording: a duplicated transcript is not just
+        // untidy, it makes the event stream a misleading account of the
+        // conversation, and the event stream is what everything downstream
+        // reasons from.
+        //
+        // Dedupe is scoped to the reply in flight and cleared on `reply.done`,
+        // so a user who asks the same thing twice still sees two answers.
+        if (text === this.lastAgentTranscript) return;
+        this.lastAgentTranscript = text;
+        // Its length and writing system, for the reply's summary. Never the
+        // words: see `ReplyLedger.transcript`.
+        this.replies.transcript(text);
+        this.options.onAgentTranscript(text);
         return;
       }
 
@@ -361,7 +466,9 @@ export class VoiceAgentSession {
         const name = str(message.name, 120);
         if (callId === '' || name === '') return;
 
-        this.setPhase('TOOL', `Running ${name}`);
+        // The phase detail becomes the caption under the orb. Axon's own words
+        // for the act, never the tool's name.
+        this.setPhase('TOOL', describeProgress(name, message.arguments) ?? 'Working on it');
         // Never awaited here: this is a socket handler, and blocking it would
         // stall every subsequent frame including the user's own audio.
         void this.bridge.handleToolCall(callId, name, message.arguments);
@@ -371,6 +478,9 @@ export class VoiceAgentSession {
       case 'reply.done': {
         const status = str(message.status, 32) || 'completed';
         this.finishSpeech();
+        this.summariseReply(status);
+        // A new reply may legitimately say what the last one said.
+        this.lastAgentTranscript = null;
 
         // The protocol's rule: results are flushed here, not when they are
         // ready, and an interrupted turn discards them.
@@ -411,27 +521,43 @@ export class VoiceAgentSession {
    * accumulated: the whole point of streaming is that Axon starts speaking
    * before the reply is finished, and a buffer here would put the latency back.
    */
+  /**
+   * One `reply.audio` message.
+   *
+   * Every payload is now ACCEPTED or REJECTED WITH A REASON, and counted
+   * against the reply it belongs to. These were three silent `return`s, which
+   * is why a reply that appeared on screen but was never heard could not be
+   * traced: see `reply-audio.ts`. The acceptance rules are the ones that were
+   * always here, plus refusing a payload that is not base64 at all.
+   */
   private receiveAudio(data: unknown): void {
-    if (typeof data !== 'string' || data === '') return;
+    const result = classifyReplyAudio(data, VOICE_AGENT_LIMITS.maxInboundAudioBytes);
 
-    let pcm: Buffer;
-    try {
-      pcm = Buffer.from(data, 'base64');
-    } catch {
+    if (!result.accepted) {
+      const event = this.replies.audio(result, this.speechId, null);
+      this.options.onReplyAudio?.(event);
       return;
     }
-    if (pcm.byteLength === 0 || pcm.byteLength > VOICE_AGENT_LIMITS.maxInboundAudioBytes) return;
 
     const speechId = this.speechId ?? this.beginSpeech();
     this.chunkSequence += 1;
 
+    const event = this.replies.audio(result, speechId, this.chunkSequence);
+    this.options.onReplyAudio?.(event);
+
     this.options.onAudioChunk({
       speechId,
-      pcm: new Uint8Array(pcm),
+      pcm: new Uint8Array(result.pcm),
       sampleRate: VOICE_AGENT_LIMITS.sampleRate,
       sequence: this.chunkSequence,
       final: false,
     });
+  }
+
+  /** The reply in flight ended; say what it contained, if anyone asked. */
+  private summariseReply(status: string): void {
+    const summary = this.replies.done(status);
+    if (summary) this.options.onReplySummary?.(summary);
   }
 
   private beginSpeech(): string {

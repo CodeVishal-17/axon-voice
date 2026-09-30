@@ -40,6 +40,66 @@ export interface RuntimeConfig {
   readonly forbiddenRoots: readonly string[];
   readonly approvalTimeoutMs: number;
   readonly devConsoleEnabled: boolean;
+  /**
+   * Where a demo recording is written, and whether one is made at all.
+   *
+   * Two conditions, not one: a development build AND `AXON_DEMO_RECORDING=1`.
+   * A packaged Axon cannot be made to record by setting an environment
+   * variable, and a developer cannot start recording by accident. The file
+   * sits beside the event log because it is the same kind of artifact — a
+   * record of what happened, written for the person debugging it afterwards.
+   */
+  readonly demoRecordingEnabled: boolean;
+  readonly demoRecordingPath: string;
+  /**
+   * Wake-word diagnostics: what the local recognizer heard, and why it did or
+   * did not wake. Development builds only, and only with AXON_WAKE_DEBUG=1.
+   * Printed to the developer console — never written to the event log, never
+   * sent anywhere, and it never includes audio.
+   */
+  readonly wakeDebugEnabled: boolean;
+  /**
+   * Voice-path diagnostics: capture format and cadence, frames reaching main,
+   * audio sent to AssemblyAI, socket queueing, and the provider's partial and
+   * final transcripts. Development builds only, with AXON_VOICE_DEBUG=1. To the
+   * developer console; never the event log, never IPC, never audio.
+   */
+  readonly voiceDebugEnabled: boolean;
+  /**
+   * Which local wake-word engine to arm: 'keyword' (the default dedicated
+   * keyword spotter), 'windows' (the original speech recognizer, kept as the
+   * control arm), or 'none'.
+   *
+   * Carried raw rather than parsed here because `create-wake-detector.ts` is
+   * where an unknown value has to become a sentence a person can read, and a
+   * config file that silently corrected it would hide a typo that leaves Axon
+   * not listening.
+   */
+  readonly wakeEngine: string | undefined;
+  /**
+   * `AXON_WAKE_THRESHOLD`: the keyword spotter's detection threshold.
+   *
+   * Exists for `npm run wake:calibrate`, which sweeps it. Unset — the normal
+   * case — means the measured default in `wake-keywords.ts`.
+   */
+  readonly wakeThreshold: string | undefined;
+  /**
+   * `AXON_WAKE_CALIBRATE`: a comma-separated list of extra thresholds to
+   * measure alongside the real one, for `npm run wake:calibrate`.
+   *
+   * Development builds only. Each entry is a whole speech model in a process
+   * of its own, so a packaged Axon must not be persuadable to run five of them
+   * by setting an environment variable.
+   */
+  readonly wakeCalibrate: string | undefined;
+  /** `AXON_WAKE_FOCUS`: keyword id for the focus diagnostic. Development builds only. */
+  readonly wakeFocus: string | undefined;
+  /**
+   * `AXON_CAPTURE_PROCESSING`: a controlled A/B of the browser's microphone
+   * processing, e.g. `ec=off`. Development builds only; a packaged Axon always
+   * captures with the defaults. Main decides it; the renderer is only told.
+   */
+  readonly captureProcessing: string | undefined;
 }
 
 const DEFAULT_APPROVAL_TIMEOUT_MS = 60_000;
@@ -125,5 +185,14 @@ export function resolveRuntimeConfig({ home, env, isDev, sessionData }: ConfigIn
     forbiddenRoots: Array.from(new Set(forbiddenRoots)),
     approvalTimeoutMs: parseTimeout(env.AXON_APPROVAL_TIMEOUT_MS),
     devConsoleEnabled: isDev,
+    demoRecordingEnabled: isDev && env.AXON_DEMO_RECORDING === '1',
+    demoRecordingPath: path.join(logDir, 'demo-recording.jsonl'),
+    wakeDebugEnabled: isDev && env.AXON_WAKE_DEBUG === '1',
+    voiceDebugEnabled: isDev && env.AXON_VOICE_DEBUG === '1',
+    wakeEngine: env.AXON_WAKE_ENGINE,
+    wakeThreshold: env.AXON_WAKE_THRESHOLD,
+    wakeCalibrate: isDev ? env.AXON_WAKE_CALIBRATE : undefined,
+    wakeFocus: isDev ? env.AXON_WAKE_FOCUS : undefined,
+    captureProcessing: isDev ? env.AXON_CAPTURE_PROCESSING : undefined,
   };
 }

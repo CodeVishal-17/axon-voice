@@ -1,22 +1,30 @@
 /**
- * Settings, memory and privacy.
+ * Settings — only what actually exists.
  *
- * One drawer with three sections rather than a settings dashboard. Axon has
- * five settings; a page of nested tabs for five settings is ceremony that
- * makes a product feel bigger and understand itself less.
- *
- * THE PRIVACY SECTION IS THE POINT. Axon now keeps three separate things on
- * disk — conversations, long-term memory, and the browser's own profile — and
- * they have different lifetimes and different delete buttons. A user who
- * clears their chat history and assumes they have signed out of GitHub has
- * been misled by the interface, not by the code. So the three are named
- * separately, explained in a sentence each, and their controls are apart.
+ * Every control here changes something real, through main, which validates it:
+ * the push-to-talk shortcut, spoken replies, the workspace folder, reopening the
+ * last conversation, and memory. Appearance is the one local preference, kept
+ * by the page. The Wake word, Privacy and About pages explain; they do not
+ * pretend to configure things that cannot be configured.
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import type { AxonSettings, MemoryEntry, PersistenceStatus, SessionRecord } from '@axon/core';
+import type {
+  AxonSettings,
+  ListeningStatus,
+  MemoryEntry,
+  PersistenceStatus,
+  SessionRecord,
+  StartupStatus,
+  VoiceAgentStatus,
+} from '@axon/core';
+import type { Theme } from '../../state/theme.js';
 
 export interface SettingsPanelProps {
+  readonly theme: Theme;
+  onThemeChange(theme: Theme): void;
+  readonly voiceAgent: VoiceAgentStatus;
+  readonly listening: ListeningStatus;
   readonly settings: AxonSettings;
   readonly persistence: PersistenceStatus;
   readonly hotkeyInForce: string | null;
@@ -34,9 +42,18 @@ export interface SettingsPanelProps {
   clearMemories(): Promise<void>;
 }
 
-type Tab = 'general' | 'memory' | 'privacy';
+const TABS = [
+  ['appearance', 'Appearance'],
+  ['voice', 'Voice'],
+  ['wake', 'Wake word'],
+  ['conversations', 'Conversations'],
+  ['memory', 'Memory'],
+  ['privacy', 'Privacy'],
+  ['about', 'About'],
+] as const;
 
-/** "Control+Shift+Space" -> "Ctrl + Shift + Space". */
+type Tab = (typeof TABS)[number][0];
+
 function prettyHotkey(accelerator: string): string {
   return accelerator.replace(/\bControl\b/g, 'Ctrl').split('+').join(' + ');
 }
@@ -48,7 +65,7 @@ function shortDate(iso: string): string {
 }
 
 export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
-  const [tab, setTab] = useState<Tab>('general');
+  const [tab, setTab] = useState<Tab>('appearance');
   const [error, setError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<readonly SessionRecord[]>([]);
   const [memories, setMemories] = useState<readonly MemoryEntry[]>([]);
@@ -56,7 +73,7 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
   const [workspaceDraft, setWorkspaceDraft] = useState(props.settings.workspacePath ?? '');
   const [confirmingClear, setConfirmingClear] = useState(false);
 
-  const { listSessions, listMemories } = props;
+  const { listSessions, listMemories, onClose } = props;
 
   const refresh = useCallback(async (): Promise<void> => {
     const [nextSessions, nextMemories] = await Promise.all([listSessions(), listMemories()]);
@@ -68,38 +85,44 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
     void refresh();
   }, [refresh]);
 
-  // Escape closes. A settings drawer that traps you is a settings drawer people
-  // avoid opening.
+  // Escape closes, as any dialog should.
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') props.onClose();
+      if (event.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('keydown', onKey);
     };
-  }, [props]);
+  }, [onClose]);
 
   const apply = useCallback(
     async (patch: Partial<AxonSettings>): Promise<void> => {
-      const failure = await props.onUpdate(patch);
-      setError(failure);
+      setError(await props.onUpdate(patch));
     },
     [props],
   );
 
   return (
-    <div className="settings-scrim" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) props.onClose(); }}>
+    <div
+      className="settings-scrim"
+      role="presentation"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <aside className="settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header className="settings-head">
           <h2 id="settings-title">Settings</h2>
-          <button type="button" className="settings-close" onClick={props.onClose} aria-label="Close settings">
-            ✕
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close settings">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            </svg>
           </button>
         </header>
 
-        <nav className="settings-tabs" role="tablist">
-          {(['general', 'memory', 'privacy'] as const).map((name) => (
+        <nav className="settings-tabs" role="tablist" aria-label="Settings sections">
+          {TABS.map(([name, label]) => (
             <button
               key={name}
               type="button"
@@ -108,7 +131,7 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
               className={`settings-tab${tab === name ? ' settings-tab-active' : ''}`}
               onClick={() => setTab(name)}
             >
-              {name === 'general' ? 'General' : name === 'memory' ? 'Memory' : 'Privacy'}
+              {label}
             </button>
           ))}
         </nav>
@@ -119,9 +142,37 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
           </p>
         ) : null}
 
-        {tab === 'general' ? (
-          <section className="settings-body">
-            <h3 className="settings-section">Voice</h3>
+        {tab === 'appearance' ? (
+          <section className="settings-body" role="tabpanel" aria-label="Appearance">
+            <h3 className="settings-section">Theme</h3>
+            <div className="theme-choice" role="radiogroup" aria-label="Theme">
+              {(['dark', 'light'] as const).map((choice) => (
+                <button
+                  key={choice}
+                  type="button"
+                  role="radio"
+                  aria-checked={props.theme === choice}
+                  className={`theme-option theme-option-${choice}${props.theme === choice ? ' theme-option-active' : ''}`}
+                  onClick={() => props.onThemeChange(choice)}
+                >
+                  <span className="theme-swatch" aria-hidden="true">
+                    <span className="theme-swatch-orb" />
+                  </span>
+                  {choice === 'dark' ? 'Dark' : 'Light'}
+                </button>
+              ))}
+            </div>
+            <p className="settings-note">Remembered on this computer.</p>
+          </section>
+        ) : null}
+
+        {tab === 'voice' ? (
+          <section className="settings-body" role="tabpanel" aria-label="Voice">
+            <p className="settings-note">
+              {props.voiceAgent.available
+                ? 'Spoken conversation is available.'
+                : (props.voiceAgent.reason ?? 'Spoken conversation is unavailable.')}
+            </p>
 
             <label className="settings-field">
               <span className="settings-label">Push-to-talk shortcut</span>
@@ -152,33 +203,48 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
               checked={props.settings.speechEnabled}
               onChange={(value) => void apply({ speechEnabled: value })}
             />
+          </section>
+        ) : null}
 
-            <h3 className="settings-section">Workspace</h3>
+        {tab === 'wake' ? (
+          <section className="settings-body" role="tabpanel" aria-label="Wake word">
+            <p className={`wake-status wake-status-${props.voiceAgent.armed ? 'on' : 'off'}`} role="status">
+              <span className="wake-status-dot" aria-hidden="true" />
+              {props.voiceAgent.armed
+                ? 'Listening for your wake phrase on this device.'
+                : props.listening.available
+                  ? 'Not listening for the wake phrase right now.'
+                  : (props.listening.reason ?? 'The local recognizer is unavailable on this computer.')}
+            </p>
 
-            <label className="settings-field">
-              <span className="settings-label">Folder Axon may write to without asking</span>
-              <span className="settings-hint">
-                Anywhere else still asks you first. Leave empty for the default inside your Axon folder.
-              </span>
-              <span className="settings-row">
-                <input
-                  className="settings-input"
-                  value={workspaceDraft}
-                  placeholder="C:\\Users\\you\\Documents\\Axon"
-                  onChange={(event) => setWorkspaceDraft(event.target.value)}
-                />
-                <button
-                  type="button"
-                  className="settings-apply"
-                  onClick={() => void apply({ workspacePath: workspaceDraft.trim() === '' ? null : workspaceDraft.trim() })}
-                >
-                  Apply
-                </button>
-              </span>
-            </label>
+            <p className="settings-lead">
+              Axon listens locally for your wake phrase. Audio is sent to the voice service only after activation.
+            </p>
 
-            <h3 className="settings-section">Conversations</h3>
+            <StartupToggle />
 
+            <h3 className="settings-section">What wakes Axon</h3>
+            <p className="settings-note">
+              Say <strong>“Hey Axon”</strong>, <strong>“Hello Axon”</strong> or <strong>“Hi Axon”</strong>. Axon does not
+              wake on its name alone, on a greeting alone, or on a sentence that simply mentions it. Say the phrase on its own, then what you need.
+            </p>
+
+            <h3 className="settings-section">What happens to the audio</h3>
+            <p className="settings-note">
+              A recognizer on this computer hears short moments of speech and keeps none of them. Nothing is recorded,
+              and nothing leaves the machine until you activate a conversation.
+            </p>
+
+            <h3 className="settings-section">If it does not respond</h3>
+            <p className="settings-note">
+              Click the orb in this window, or press the push-to-talk shortcut. Either is the same activation as saying
+              the phrase.
+            </p>
+          </section>
+        ) : null}
+
+        {tab === 'conversations' ? (
+          <section className="settings-body" role="tabpanel" aria-label="Conversations">
             <Toggle
               label="Reopen my last conversation"
               hint="When Axon starts, continue where you left off instead of starting fresh."
@@ -196,7 +262,10 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
               <ul className="settings-list">
                 {sessions.length === 0 ? <li className="settings-empty">No saved conversations yet.</li> : null}
                 {sessions.slice(0, 12).map((session) => (
-                  <li key={session.id} className={`settings-item${session.id === props.conversationId ? ' settings-item-current' : ''}`}>
+                  <li
+                    key={session.id}
+                    className={`settings-item${session.id === props.conversationId ? ' settings-item-current' : ''}`}
+                  >
                     <button
                       type="button"
                       className="settings-item-main"
@@ -220,6 +289,29 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
               </ul>
             </div>
 
+            <h3 className="settings-section">Workspace</h3>
+            <label className="settings-field">
+              <span className="settings-label">Folder Axon may write to without asking</span>
+              <span className="settings-hint">
+                Anywhere else still asks you first. Leave empty for the default inside your Axon folder.
+              </span>
+              <span className="settings-row">
+                <input
+                  className="settings-input"
+                  value={workspaceDraft}
+                  placeholder="C:\Users\you\Documents\Axon"
+                  onChange={(event) => setWorkspaceDraft(event.target.value)}
+                />
+                <button
+                  type="button"
+                  className="settings-apply"
+                  onClick={() => void apply({ workspacePath: workspaceDraft.trim() === '' ? null : workspaceDraft.trim() })}
+                >
+                  Apply
+                </button>
+              </span>
+            </label>
+
             <button type="button" className="settings-reset" onClick={() => void props.onReset().then(setError)}>
               Reset all settings
             </button>
@@ -227,19 +319,17 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
         ) : null}
 
         {tab === 'memory' ? (
-          <section className="settings-body">
+          <section className="settings-body" role="tabpanel" aria-label="Memory">
             <Toggle
               label="Use what Axon remembers"
               hint="When off, saved memories stay on disk but are not used in conversations."
               checked={props.settings.memoryEnabled}
               onChange={(value) => void apply({ memoryEnabled: value })}
             />
-
             <p className="settings-note">
-              Axon only remembers something when you ask it to, and it asks before saving. It refuses to store
-              passwords, keys, tokens and card numbers.
+              Axon only remembers something when you ask it to, and it asks before saving. It refuses to store passwords,
+              keys, tokens and card numbers.
             </p>
-
             <ul className="settings-list">
               {memories.length === 0 ? <li className="settings-empty">Axon has not been asked to remember anything.</li> : null}
               {memories.map((memory) => (
@@ -274,11 +364,19 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
                 </li>
               ))}
             </ul>
-
             {memories.length > 0 ? (
               confirmingClear ? (
                 <span className="settings-row">
-                  <button type="button" className="settings-danger" onClick={() => void props.clearMemories().then(refresh).then(() => setConfirmingClear(false))}>
+                  <button
+                    type="button"
+                    className="settings-danger"
+                    onClick={() =>
+                      void props
+                        .clearMemories()
+                        .then(refresh)
+                        .then(() => setConfirmingClear(false))
+                    }
+                  >
                     Yes, forget everything
                   </button>
                   <button type="button" className="settings-apply" onClick={() => setConfirmingClear(false)}>
@@ -295,35 +393,27 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
         ) : null}
 
         {tab === 'privacy' ? (
-          <section className="settings-body">
-            {/* Three stores, named separately, because they are three things.
-                Conflating them in the interface is how a user ends up believing
-                they have signed out of something they have not. */}
+          <section className="settings-body" role="tabpanel" aria-label="Privacy">
             <h3 className="settings-section">Conversation history</h3>
             <p className="settings-note">
               What you and Axon said to each other, saved on this computer so you can pick up where you left off.
               Deleting a conversation removes its messages for good.
             </p>
-
             <h3 className="settings-section">Long-term memory</h3>
             <p className="settings-note">
-              Separate from your conversations. Only things you asked Axon to remember, and only after you approved
-              each one. Clearing memory does not delete your conversations.
+              Separate from your conversations. Only things you asked Axon to remember, and only after you approved each
+              one. Clearing memory does not delete your conversations.
             </p>
-
             <h3 className="settings-section">Browser profile</h3>
             <p className="settings-note">
-              Axon&apos;s browser keeps its own sign-ins and cookies, exactly as any browser does — and separately from
-              everything above. Axon never reads them, never copies them into its database, and never sees a password
-              you type there. Clearing your conversations or memory does <strong>not</strong> sign you out of anything.
+              Axon&apos;s browser keeps its own sign-ins and cookies, as any browser does. Axon never reads them, never copies
+              them into its database, and never sees a password you type there.
             </p>
-
             <h3 className="settings-section">What Axon never stores</h3>
             <p className="settings-note">
-              Passwords, API keys, tokens, cookies and card numbers are refused rather than saved. Microphone audio is
-              never written to disk — only the text of what you said. Axon has no hidden record of its own reasoning.
+              Passwords, API keys, tokens, cookies and card numbers are refused rather than saved. Microphone audio is never
+              written to disk.
             </p>
-
             <h3 className="settings-section">Where it lives</h3>
             <p className="settings-note settings-path">
               {props.persistence.available
@@ -332,8 +422,64 @@ export function SettingsPanel(props: SettingsPanelProps): React.JSX.Element {
             </p>
           </section>
         ) : null}
+
+        {tab === 'about' ? (
+          <section className="settings-body" role="tabpanel" aria-label="About">
+            <p className="settings-lead">Axon is a voice agent for your Windows desktop.</p>
+            <p className="settings-note">
+              A realtime voice service hears you, reasons about what you asked, and speaks. Axon decides
+              which actions are allowed, asks you before anything consequential, and checks the result by looking.
+            </p>
+            <h3 className="settings-section">What Axon deliberately cannot do</h3>
+            <p className="settings-note">
+              Run shell commands, press keys or shortcuts, move the mouse, read arbitrary files, type passwords, submit or
+              buy anything without your decision, or see images.
+            </p>
+          </section>
+        ) : null}
       </aside>
     </div>
+  );
+}
+
+/**
+ * Start with Windows. The operating system is the source of truth: this reads
+ * the setting from main each time the page opens, and shows what main reports
+ * after every change.
+ */
+function StartupToggle(): React.JSX.Element | null {
+  const [status, setStatus] = useState<StartupStatus | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    void window.axon
+      ?.getStartup()
+      .then((next) => {
+        if (live) setStatus(next);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  if (!status) return null;
+  return (
+    <Toggle
+      label="Start Axon when I sign in"
+      hint={
+        status.available
+          ? 'Axon starts in the background with no window, listens on this computer for “Hey Axon”, and shows its orb when you say it.'
+          : (status.reason ?? 'Not available on this computer.')
+      }
+      checked={status.enabled}
+      onChange={(value) => {
+        void window.axon
+          ?.setStartup(value)
+          .then(setStatus)
+          .catch(() => undefined);
+      }}
+    />
   );
 }
 
@@ -349,7 +495,7 @@ function Toggle({ label, hint, checked, onChange }: ToggleProps): React.JSX.Elem
     <label className="settings-field settings-toggle">
       <span className="settings-row settings-row-spread">
         <span className="settings-label">{label}</span>
-        <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+        <input className="switch" type="checkbox" role="switch" checked={checked} onChange={(event) => onChange(event.target.checked)} />
       </span>
       <span className="settings-hint">{hint}</span>
     </label>

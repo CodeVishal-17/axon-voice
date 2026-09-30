@@ -1,0 +1,24 @@
+.orb {
+  position: relative;
+  display: inline-block;
+  /* The canvas is twice the orb so the glow has room; it is centred on the
+     element's own box rather than pushing the layout around. */
+  isolation: isolate;
+}
+
+.orb__canvas {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  translate: -50% -50%;
+  pointer-events: none;
+}
+
+.orb__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

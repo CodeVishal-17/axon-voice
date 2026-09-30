@@ -21,6 +21,20 @@ export default defineConfig({
           // Second entry so `scripts/verify-tools.cjs` can build the real
           // runtime graph inside Electron without launching a window.
           runtime: resolve(__dirname, 'src/main/runtime.ts'),
+          // The keyword spotter runs as a CHILD PROCESS, not as part of main,
+          // so it needs its own entry point rather than being pulled into the
+          // main bundle. See the header of `kws-host.ts` for why the process
+          // boundary is the point.
+          'kws-host': resolve(__dirname, 'src/main/wake/kws-host.ts'),
+          // Fourth entry so `scripts/fetch-wake-model.cjs` checks the SAME wake
+          // phrase constants the product runs on, rather than a copy of them
+          // that could drift and leave Axon deaf with no error anywhere.
+          'wake-keywords': resolve(__dirname, 'src/main/wake/wake-keywords.ts'),
+          // So `scripts/voice-live.cjs` scores transcripts with the tested
+          // matcher rather than a copy of it.
+          'transcript-match': resolve(__dirname, 'src/main/voice/transcript-match.ts'),
+          // So `scripts/wake-focus.cjs` classifies with the tested module.
+          'focus-report': resolve(__dirname, 'src/main/wake/focus-report.ts'),
         },
       },
     },

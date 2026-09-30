@@ -1,0 +1,71 @@
+/**
+ * The site's design language, as tokens.
+ *
+ * Dark-first and near-black, because the product is a desktop overlay that sits
+ * over whatever you are working on. The accents are the desktop app's OWN
+ * ambient colours (`styles.css` in the renderer: 92 124 255, 40 204 190,
+ * 196 112 255) and its real per-state colours, so the website and the thing it
+ * describes are recognisably the same product.
+ *
+ * Glass is used twice, on purpose. Gradients are wide and low-contrast rather
+ * than decorative. Type is large and the spacing is generous; there is no card
+ * grid holding the page together.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* Foundation: near-black, with two barely-lit elevations. */
+  --ink: #05070d;
+  --ink-2: #080b13;
+  --raise: rgba(255, 255, 255, 0.032);
+  --raise-2: rgba(255, 255, 255, 0.055);
+  --line: rgba(255, 255, 255, 0.09);
+  --line-bright: rgba(255, 255, 255, 0.16);
+
+  /* Text. Three steps, no more. */
+  --text: #f4f6fc;
+  --text-dim: #a8b1c6;
+  --text-faint: #6f7893;
+
+  /* The accents, from the desktop app. */
+  --blue: 92 124 255;
+  --violet: 196 112 255;
+  --teal: 40 204 190;
+  --amber: 255 166 72;
+
+  --accent: rgb(var(--blue));
+  --accent-soft: rgb(var(--blue) / 0.16);
+
+  /* Glass, used sparingly. */
+  --glass: rgba(16, 20, 32, 0.66);
+  --glass-edge: rgba(255, 255, 255, 0.1);
+
+  --radius-s: 10px;
+  --radius-m: 16px;
+  --radius-l: 24px;
+  --radius-xl: 32px;
+
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* One measure, one rhythm.
+
+     `--section-y` was tightened by about a fifth in the polish pass: the page
+     read as spacious at the old value and as slow between sections, which is
+     the kind of emptiness that reads as an unfinished page rather than a
+     generous one. Everything else in the rhythm is derived from it. */
+  --page: 1180px;
+  --gutter: clamp(20px, 5vw, 64px);
+  --section-y: clamp(72px, 10vh, 140px);
+
+  --font: 'Segoe UI Variable Display', 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+  --mono: 'Cascadia Mono', 'Consolas', ui-monospace, monospace;
+
+  /* Type scale: large headlines, tight leading, wide tracking on labels. */
+  --display: clamp(2.9rem, 8.2vw, 6.4rem);
+  --h2: clamp(2rem, 4.4vw, 3.4rem);
+  --h3: clamp(1.15rem, 1.7vw, 1.45rem);
+  --body: clamp(1rem, 1.15vw, 1.14rem);
+  --label: 0.74rem;
+}

@@ -32,7 +32,7 @@
  * the real browser window — makes the final call.
  */
 
-import { escalate, type RiskAssessment, type RiskLevel } from '@axon/core';
+import { escalate, type RiskAssessment, type RiskLevel, type SensitivityClass } from '@axon/core';
 import type { ObservedElement } from '@axon/core';
 
 /**
@@ -232,6 +232,18 @@ export function typeRisk(
   element: ObservedElement | null,
   submit: boolean,
   context: ActionContext | null,
+  /**
+   * What the TEXT is, as `sensitivity.ts` classifies it.
+   *
+   * The CLASS, never the string: a reason, a dialog parameter and an event are
+   * all places a credential must never appear, and the surest way to keep it
+   * out of them is for the layer that writes them never to hold it.
+   *
+   * Optional so an existing caller that only cares about the field keeps
+   * working — but every caller in Axon passes it, and `browser-security`
+   * asserts that the browser tool does.
+   */
+  textSensitivity: SensitivityClass = 'NORMAL',
 ): RiskAssessment {
   if (!element) {
     return {
@@ -254,6 +266,23 @@ export function typeRisk(
       reason:
         `"${label}" is a password, payment or one-time-code field. Axon never types credentials — ` +
         'if the page needs one, the user should type it themselves.',
+    };
+  }
+
+  // TWO INDEPENDENT REFUSALS, and this is the second.
+  //
+  // The FIELD may be a credential field, which the page declares. The TEXT may
+  // be a credential whatever field it was headed for — a token pasted into a
+  // cover letter is still a token, and a page that receives one has received
+  // it. The desktop path has refused this since Phase 2; the browser path
+  // checked only the field, so the same content was refused by one tool and
+  // typed by the other. One sensitivity model means one answer.
+  if (textSensitivity === 'SECRET') {
+    return {
+      level: 'FORBIDDEN',
+      reason:
+        'That text looks like a password, key, token, card number or one-time code. ' +
+        'Axon does not type credentials into web pages, at any risk level.',
     };
   }
 

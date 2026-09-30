@@ -22,8 +22,13 @@ export interface SpeechSink {
    * The same direction and the same rule as `deliver`: bytes chosen by main,
    * with no counterpart that lets the renderer ask for audio. Streaming is a
    * different framing of the same one-way channel, not a new privilege.
+   *
+   * Returns false when no live window took it — the voice surface was gone —
+   * so a reply that was sent but never reached anything that could play it
+   * is a number in the diagnostics rather than a mystery. A sink that cannot
+   * tell returns nothing, which is read as delivered.
    */
-  chunk(chunk: SpeechChunk): void;
+  chunk(chunk: SpeechChunk): boolean | void;
   stop(speechId: string): void;
 }
 
@@ -57,8 +62,10 @@ export class SpeechTransport {
    * chunk means Axon is quieter than intended, which is the safe failure; the
    * alternative — throwing inside a socket handler — takes the process down.
    */
-  chunk(chunk: SpeechChunk): void {
-    this.sink?.chunk(chunk);
+  /** True when a live window took the chunk. See `SpeechSink.chunk`. */
+  chunk(chunk: SpeechChunk): boolean {
+    if (!this.sink) return false;
+    return this.sink.chunk(chunk) !== false;
   }
 
   stop(speechId: string): void {

@@ -37,6 +37,7 @@
 
 import type { RiskAssessment, RiskLevel } from '@axon/core';
 import { escalate } from '@axon/core';
+import { assumeHttps } from '../browser/url-policy.js';
 
 /**
  * Kinds of destination that change something about a person rather than
@@ -211,13 +212,13 @@ export function checkGoalBoundary(check: GoalCheckInput): RiskAssessment | null 
   // reading of the element, which is a better signal than a URL — and a click
   // that leads somewhere consequential will be re-judged when the navigation
   // it causes is re-checked by the browser's own policy.
-  if (check.tool !== 'browser.open' && check.tool !== 'browser.navigate') return null;
+  if (check.tool !== 'browser.open' && check.tool !== 'browser.navigate' && check.tool !== 'web.open') return null;
 
   const url = (check.input as { url?: unknown } | null)?.url;
   if (typeof url !== 'string') return null;
 
-  const intent = classifyDestination(url);
-  if (!intent) return null;
+  const intent = classifyDestination(assumeHttps(url));
+  if (!intent) return check.tool === 'web.open' ? siteBoundary(url, check.goal) : null;
 
   if (goalPermits(check.goal, intent)) {
     // The user asked for exactly this. No escalation — and saying so in the
@@ -234,6 +235,51 @@ export function checkGoalBoundary(check: GoalCheckInput): RiskAssessment | null 
     reason:
       `This page would ${intent.description}, which the user did not ask for. ` +
       'Opening a site is not permission to sign up, sign in, buy, or change account settings on it.',
+  };
+}
+
+/** Second-level labels that are really part of a country suffix: bbc.CO.uk. */
+const SUFFIX_LABELS = new Set(['co', 'com', 'org', 'net', 'ac', 'gov', 'edu', 'ne', 'or']);
+
+/**
+ * The name a person would say for a site: "youtube" for www.youtube.com,
+ * "google" for docs.google.com, "bbc" for www.bbc.co.uk. Null for an address
+ * that is not a hostname with a name in it.
+ */
+export function siteName(url: string): string | null {
+  let host: string;
+  try {
+    host = new URL(assumeHttps(url)).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  const labels = host.split('.').filter((label) => label !== '');
+  if (labels.length < 2 || labels.every((label) => /^\d+$/.test(label))) return null;
+  const second = labels[labels.length - 2] ?? '';
+  const name = labels.length >= 3 && SUFFIX_LABELS.has(second) ? labels[labels.length - 3] : second;
+  return name && name.length >= 2 ? name : null;
+}
+
+/**
+ * `web.open` hands a site to the user's OWN browser — their sessions, their
+ * saved sign-ins — which is more than Axon's sandboxed window ever carries. So
+ * a site the user did not name is asked about first. "Open YouTube" names
+ * youtube.com; "find me a recipe" names no site, and the model's choice of one
+ * is shown to the person before it opens.
+ *
+ * ESCALATION ONLY, like everything here: a site the user named is simply not
+ * escalated, never made safer than the URL policy says.
+ */
+function siteBoundary(url: string, goal: string | null): RiskAssessment | null {
+  const name = siteName(url);
+  if (!name) return null;
+  const said = (goal ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  if (said.includes(name)) return null;
+  return {
+    level: 'REQUIRES_APPROVAL',
+    reason:
+      `The user did not name ${name}, and web.open opens it in their own browser, where they are signed in. ` +
+      'Axon asks before opening a site the user did not ask for.',
   };
 }
 

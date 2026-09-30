@@ -1,39 +1,42 @@
 # Axon Voice
 
-A voice-first desktop AI agent for Windows. Axon understands a goal, plans the
-steps, acts on your computer where you can see it happening, and asks before it
-does anything sensitive.
+A voice agent for your Windows desktop that can move from conversation to
+**verified action** on your computer — without giving the model control of the
+machine.
 
-**Status: v0.6.0 — Step 6, persistence and identity.** The loop is closed. Press
-`Ctrl+Shift+Space` (or click **Talk to Axon**) and say "open Notepad": Axon
-hears you through your microphone, decides for itself when you have finished
-speaking, transcribes offline on your own machine, reasons about it with
-Claude, calls real tools through the dispatcher, asks before anything
-sensitive, and reads the answer back aloud. The orb reacts to your real voice
-on the way in and to Axon's real voice on the way out — one signal each
-direction, never a simulation.
+**AssemblyAI provides the realtime voice layer.** Speech recognition, the
+reasoning model and the spoken voice all come from AssemblyAI's Voice Agent
+API, over one WebSocket held by Axon's main process.
 
-Axon now also **reaches the web**, in a real browser window you can watch. It
-opens pages, reads them, follows links and fills in fields — and anything that
-sends, posts, buys or deletes stops and asks you first, naming the page and the
-exact content. Page text is treated as what it is: content a stranger wrote,
-which can inform Axon and cannot instruct it. Shell access is not implemented,
-deliberately. See [Roadmap](#roadmap).
+**Axon provides the action and control layer.** Every action the model
+proposes — open an app, open a page, fill a field, click a button — is a
+*request* that goes through Axon's dispatcher: schema validation, the goal
+boundary, sensitivity checks, risk and policy, a human approval where the act
+is consequential, a re-check that the approved act is still the one about to
+run, execution, and verification by looking at the result. The model decides
+what to ask for. Axon decides what is allowed.
 
-And you can now **talk to it**. Say "Hey Axon" and hold a real conversation:
-AssemblyAI's Voice Agent API supplies the recognition, the reasoning and the
-voice over a single WebSocket held by the main process, and every action it
-proposes goes through the same dispatcher, the same risk policy and the same
-approval dialog as everything else. The model changed; the security boundary
-did not.
+**What it can do today:** open installed applications and verify their windows
+appeared; open, read, scroll and follow links on web pages in its own browser
+window; fill in form fields; click page controls; read the controls on the
+window in front (Windows UI Automation); press or fill an on-screen control by
+reference, with approval; tell the time from the machine's clock; save a
+screenshot; write files inside its own workspace; remember facts you approve.
+It asks before anything that sends, submits, buys, deletes or leaves the
+machine, and it refuses credentials outright.
 
-And Axon now **remembers**. Conversations survive a restart, a short bounded
-slice of the one you were having is handed back to the model on the next turn,
-and Axon can be asked to remember a durable fact about you or your work — with
-your approval, one fact at a time, in words you can read back and delete. It
-all lives in a single SQLite file under your own profile. Nothing is uploaded,
-and anything shaped like a credential is refused outright rather than stored.
-See [What Axon remembers](#what-axon-remembers).
+**What it deliberately cannot do:** run shell or PowerShell commands, press
+keys or shortcuts (`keyboard.press` does not exist), move the mouse, read
+arbitrary files, type passwords or keys, submit or purchase without a human
+decision, or see images — screenshots are captured, but there is no vision
+model and the voice protocol has no image channel, so Axon works from the
+accessibility tree, not from pixels. See [Known limitations](#known-limitations).
+
+**Giving the demo?** Start with [DEMO_SETUP.md](DEMO_SETUP.md), the stage script
+in [docs/DEMO.md](docs/DEMO.md), and [DEMO_EMERGENCY_PLAYBOOK.md](DEMO_EMERGENCY_PLAYBOOK.md).
+
+The typed path (the composer) optionally uses Claude via `ANTHROPIC_API_KEY`;
+the spoken path does not need it. Both go through the same dispatcher.
 
 ---
 
@@ -45,7 +48,7 @@ See [What Axon remembers](#what-axon-remembers).
 | Node | 20.19+ (22 LTS recommended — Electron 44 declares `node >= 22.12`, which is advisory; 20.20 works) |
 | Keys | `ASSEMBLYAI_API_KEY` for spoken conversation — recognition, reasoning and voice all come from it. `ANTHROPIC_API_KEY` is optional and only powers the typed path. Without either, Axon still runs: the orb, the timeline, the browser, the tools and the Tool Console all work. |
 | Voice out | Windows SAPI. **No key, no account, no network.** Set `AXON_TTS_PROVIDER=none` to keep Axon silent. |
-| Wake word | Windows `System.Speech.Recognition`, entirely local. Listens for "Hey Axon" / "Hello Axon" / "Hi Axon" and nothing else leaves the machine until you say one of them. Needs an English (United States) speech language installed, which Windows 10/11 has by default. Set `AXON_STT_PROVIDER=none` to disable. |
+| Wake word | A dedicated local keyword spotter (sherpa-onnx zipformer, 3.3M, Apache-2.0), entirely on-device. Listens for "Hey Axon" / "Hello Axon" / "Hi Axon" and nothing else leaves the machine until you say one of them. Run `npm run wake:model` once to fetch the ~18 MB model; it is verified against a pinned SHA-256. Set `AXON_WAKE_ENGINE=windows` for the original Windows recognizer, or `AXON_WAKE_ENGINE=none` to disable. |
 | Voice conversation | AssemblyAI Voice Agent API, over one WebSocket held by the main process. Active-session audio is streamed to AssemblyAI; see [Privacy](#privacy-what-leaves-this-machine). |
 | Microphone | Any input device. Axon opens it only while it is listening, and Windows shows its own recording indicator throughout. |
 
@@ -54,6 +57,16 @@ See [What Axon remembers](#what-axon-remembers).
 ```bash
 npm install
 ```
+
+```bash
+npm run wake:model      # once: fetches the ~18 MB local wake-word model
+```
+
+The wake word runs on a keyword-spotting model that is too big for git. This
+downloads it into `apps/desktop/resources/wake-model/`, checks it against a
+SHA-256 pinned in the fetch script, and verifies that the model's own tokenizer
+still spells "Hey Axon" the way Axon expects. Skip it and Axon runs perfectly
+well — it just will not listen for its name, and says so in the tray.
 
 ```bash
 cp .env.example .env    # then put your ANTHROPIC_API_KEY in it
@@ -86,7 +99,9 @@ nothing to reason with.
 |---|---|
 | `npm run dev` | Build core, then run the desktop app with hot reload |
 | `npm run build` | Production build of core and the desktop app |
-| `npm run typecheck` | `tsc --noEmit` across core, main/preload and renderer |
+| `npm run web:dev` | Run the public website (`apps/web`) on <http://localhost:5174> |
+| `npm run web:build` | Typecheck and build the website into `apps/web/dist` |
+| `npm run typecheck` | `tsc --noEmit` across core, main/preload, renderer and the website |
 | `npm run lint` | ESLint, including the architectural boundary rules |
 | `npm test` | Vitest — 1014 tests, no API key and no network required |
 | `npm run verify:tools` | Build, then exercise the real tools, real speech and real recognition inside Electron |
@@ -94,6 +109,10 @@ nothing to reason with.
 | `npm run verify:browser` | Build, then open the real browser on real pages and drive it through the real dispatcher |
 | `npm run verify:persistence` | Build, then open a real SQLite database and restart it, on real files |
 | `npm run verify:all` | typecheck → lint → test → the four harnesses above (227 checks) |
+| `npm run wake:model` | Fetch and verify the local wake-word model (once per checkout) |
+| `npm run wake:live` | The wake word on a **real microphone**, spoken by you. The only thing that proves it works |
+| `npm run wake:calibrate` | Sweep the detection threshold on a real microphone, every threshold at once, recording nothing |
+| `npm run voice:live` | The ACTIVE voice session on a real microphone: say five controlled phrases, see AssemblyAI's transcript scored against each, with capture format and send cadence per utterance |
 
 To exercise the real Anthropic API end to end (skipped without a key):
 
@@ -396,7 +415,7 @@ axon-voice/
 │     ├─ ipc.ts                the complete renderer↔main surface
 │     └─ interfaces/           Brain, SpeechToText, TextToSpeech, WakeSource, Memory
 │
-└─ apps/desktop/
+├─ apps/desktop/
    ├─ src/main/
    │  ├─ index.ts              lifecycle; security → runtime → bridge → window
    │  ├─ runtime.ts            runtime assembly (shared with the verify harness)
@@ -445,10 +464,72 @@ axon-voice/
    │     ├─ tool-result-view.ts how a ToolResult is described to the model
    │     ├─ tool-surface.ts    the code-free projection of the tools
    │     └─ conversation-memory.ts  in-memory Memory (the fallback)
-   ├─ src/preload/index.ts     the audited bridge (~1.5 kB built)
-   ├─ src/renderer/            React UI; consumes events, owns nothing
-   └─ tests/
+│  ├─ src/preload/index.ts     the audited bridge (~1.5 kB built)
+│  ├─ src/renderer/            React UI; consumes events, owns nothing
+│  └─ tests/
+│
+└─ apps/web/                   the public website. Shares NO code with the app.
+   ├─ index.html
+   ├─ vite.config.ts
+   └─ src/
+      ├─ config.ts             the download destination, and nothing else
+      ├─ content.ts            every sentence on the site, in one file
+      ├─ components/           one per section, plus a canvas Orb of its own
+      ├─ hooks/                reduced motion · in-view · orb sizing
+      └─ styles/               tokens · global · sections
 ```
+
+## The website
+
+`apps/web/` is the public page for Axon: what it is, how a request becomes a
+verified action, what it can actually do, and how to get it. It is a separate
+product surface — a plain React + Vite app with no dependency on `@axon/core`,
+no Electron, no Anthropic or AssemblyAI SDK, and no access to anything in
+`.env`. Vite only inlines variables prefixed `VITE_`, and the site reads
+exactly two of them. The desktop app was not changed to make the site possible;
+the site even draws its own orb rather than importing the renderer's.
+
+Run it:
+
+```bash
+npm run web:dev
+```
+
+That serves <http://localhost:5174> (5173 belongs to the desktop renderer).
+Build and preview the production bundle:
+
+```bash
+npm run web:build
+```
+
+```bash
+npm run web:preview
+```
+
+`web:build` typechecks first, then writes `apps/web/dist/` — a static
+directory that can be served by anything. `npm run typecheck` at the repo root
+covers the site too, and `npm run lint` already reaches it.
+
+### What the site is configured with
+
+Three optional build-time variables, and nothing else:
+
+| Variable | Effect when unset |
+|---|---|
+| `VITE_AXON_DOWNLOAD_URL` | The download button renders **disabled**, with a line saying Axon runs from source today, and the header's action reads "Explore Axon" rather than offering a download |
+| `VITE_AXON_SOURCE_URL` | The source links point at this repository, `https://github.com/CodeVishal-17/axon-voice` |
+| `VITE_AXON_DEMO_VIDEO_URL` | The "See Axon in action" section shows an illustrative walkthrough, labelled as not being a recording. Set it and the same frame plays the video instead — see `apps/web/src/components/demo/DemoStage.tsx` |
+
+Set them when there is something real to point at:
+
+```bash
+VITE_AXON_DOWNLOAD_URL=https://github.com/<owner>/<repo>/releases/download/v0.1.0/Axon-Setup.exe npm run web:build
+```
+
+The button turns itself on — nothing else needs editing. Everything the site
+claims about Axon comes from this README and from the tool registry; if a
+capability is removed from the app, the corresponding card in
+`apps/web/src/content.ts` should go with it.
 
 ## The orb
 
@@ -626,12 +707,93 @@ page can connect directly; Axon deliberately does not use them, because the
 point is not that the credential is short-lived — it is that the sandboxed
 renderer, which displays text that came from web pages, has no socket at all.
 
-**The wake-word recognizer is local.** `System.Speech.Recognition` ships with
-Windows. No API key, no account, no model download, no network. The trade is
-accuracy on long free-form dictation, which is
-worth making for an assistant whose input is short instructions and whose
-interpretation is done by a model. Swapping in Whisper or a cloud recognizer is
-a new file beside `windows-stt.ts` and one arm in `create-stt.ts`.
+**The wake word is a dedicated local keyword spotter.** Not a speech
+recognizer constrained to a phrase — a 3.3M-parameter zipformer transducer
+trained for keyword spotting, running on this machine, watching for one
+sequence of word pieces and emitting nothing the rest of the time. Apache-2.0
+runtime, Apache-2.0 model, no API key, no account, no telemetry, no endpoint.
+About 3% of one core while it listens, and roughly 18 MB of ONNX that
+`npm run wake:model` fetches once and verifies against a pinned SHA-256.
+
+This replaced the Windows `System.Speech` recognizer, which passed every
+synthetic check and then scored **0/15 on a real human microphone** — audio
+arriving, speech detected, phrase never heard. The old engine is still here and
+still tested, reachable with `AXON_WAKE_ENGINE=windows`, as the control arm for
+any future measurement. `create-wake-detector.ts` argues the whole comparison,
+including why Picovoice Porcupine, openWakeWord, Vosk and whisper.cpp each lost.
+
+**"Axon" alone cannot wake Axon, structurally.** The spotter is told which word
+pieces to watch for, and the model's own tokenizer spells the phrases as
+`_HE Y _A X ON`, `_HE LL O _A X ON` and `_HI _A X ON`. The bare name is
+`_A X ON` — a prefix of nothing on that list, because every keyword begins with
+a greeting piece. This is not a rule applied to text afterwards; there is no
+path through the detector that fires on the name by itself.
+
+**The threshold was measured, not chosen.** Across two synthesised voices,
+three speaking rates and eight audio alignments, raising the detection
+threshold from 0.02 to 0.20 bought *nothing* against false activation and cost
+recall monotonically — so the default sits at 0.05, where "Hey Axon" scored
+48/48 and the brief's thirteen negatives scored 0/624. The full table, and the
+first version of it that was wrong, are in `wake-keywords.ts`.
+`npm run wake:calibrate` re-runs that table on a real microphone by running
+several thresholds at once on the same live frames — because the natural way to
+sweep a threshold is to record somebody and replay it, and Axon does not record
+anybody, ever.
+
+**The spotter runs in a process of its own, and that is the point.** It is
+started with a six-name environment holding neither API key, it is given audio
+only on stdin, and it can answer with exactly three line shapes:
+
+    READY <runtime> <threshold>
+    WAKE <keywordId> <startMs> <endMs> <behindMs>
+    ERR <code> <message>
+
+`behindMs` is how far behind live audio the spotter was when it fired — zero
+when it is keeping up, and the only latency the detector itself can add. It is
+deliberately not "how long after the phrase ended": that was tried, and the
+spotter's timestamps turned out to have an origin the host cannot observe, so
+the number was wrong by seconds. A number that cannot be computed correctly is
+not reported.
+
+`WAKE` is the whole wake event. It carries no transcript, because a keyword
+spotter produces none. The process has no IPC to the renderer, no tool
+registry, no browser, no dispatcher and no socket — `architecture.test.ts`
+holds a per-file import allowlist for every file in `main/wake/` so that stays
+checkable by reading one block. A native fault in the speech model is an exit
+code the parent restarts with bounded backoff, not a crash that takes Axon
+down; after the budget is spent it reports "wake detector unavailable" and says
+so in the tray rather than respawning forever. No audio is written to disk, and
+none is kept beyond what the model's own feature extractor holds.
+
+To see what the detector did, run a development build with `AXON_WAKE_DEBUG=1`:
+it logs when the spotter loaded, that microphone audio is arriving, a peak
+level every few seconds, and for each hit the keyword id, its timing, the
+detection lag and the decision — never audio, never credentials, and never in a
+packaged build. `npm run wake:live` opens the real app on the real microphone
+and walks you through the wake phrases and twenty things that must not wake it,
+reporting "Hey Axon" recall, false activations, detector latency, CPU and
+memory; `AXON_WAKE_LIVE_RUNS=10` repeats them, and
+`AXON_WAKE_LIVE_BACKGROUND=1` starts Axon as it starts at sign-in.
+
+**Axon runs in the background.** One Axon process holds everything. At start it
+creates a hidden, transparent overlay window — the one page that opens the
+microphone (for the wake phrase, push-to-talk and conversations) and plays
+Axon's voice — and a tray icon. Main sends capture commands and speech only to
+that page and accepts microphone audio only from it. Nothing is on screen until
+Axon is active; then a small orb appears at the bottom centre of the display the
+pointer is on, just above the taskbar, with soft light along the left and right
+edges in the orb's colour, and leaves a few seconds after Axon goes quiet. The
+overlay is click-through except over its own controls and never takes focus.
+Closing the panel does not stop Axon; "Quit Axon" in the tray does.
+
+**Starting with Windows** is a per-user sign-in entry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
+via Electron's login item): no administrator rights, no Windows service,
+visible and removable in Task Manager's Startup tab. It is off until you turn
+it on in Settings → Wake word or from the tray, and it starts Axon with
+`--background`, so nothing opens. In a development checkout the entry points at
+this checkout's Electron and app directory, so run `npm run build` once first:
+the sign-in launch loads the built app, not the dev server. `npm run
+verify:lifecycle` checks all of this against the real app.
 
 **Ending an utterance is a measurement, not a timer.** A fixed recording length
 cuts off anyone who pauses and makes everyone else wait. Axon measures the room
@@ -742,10 +904,337 @@ the safety layer, including the ones that refuse.
 | **4 ✅** | Voice in: push-to-talk, real mic capture, audio-driven VAD, offline STT, barge-in |
 | **5 ✅** | Reach: a real visible browser, bounded observation, per-action risk, HIGH_RISK, injection defences |
 | **6 ✅** | Identity: SQLite persistence, bounded restoration, approved long-term memory, settings, privacy controls |
-| 7 | Product: packaging, signing, updates |
+| **7 ✅** | Trusted local control plane: turn budgets, approval binding, goal boundary, desktop windows |
+| **8 ✅** | Computer interaction: system clock, visual observations, observation-bound click and type, four-class sensitivity |
+| **9 ✅** | Product-grade agent loop: tasks and steps, in-progress lifecycle, first-class cancellation, clarification, verified launches |
+| **10 ✅** | Product-grade demo: multi-step tasks, task grounding, clarification continuity, progress phrasing, observation providers, developer timeline |
+| **11 ✅** | Demo-ready: canonical script, rehearsal, preflight, recovery, attack suite, demo recording |
+| 12 | Product: packaging, signing, updates |
 
 Voice deliberately comes after the brain: a voice loop with nothing behind it
 is a demo of a microphone.
+
+## Seeing and acting on the screen
+
+Axon can look at the screen and act on what it saw. The shape of that
+capability is the whole of its safety, so it is worth stating precisely.
+
+**A screenshot is an observation, not a file.** `system.screenshot` captures the
+screen and, at the same moment, reads the controls the window in front
+publishes to Windows' accessibility layer. What it produces is a short-lived
+*visual observation* held in the main process: the size of the screen, which
+window is in front, and a numbered list of buttons, links and fields, each with
+a reference like `t4`. Nothing is written to disk unless you asked for a file —
+`save: true` — which means an agent that looks at the screen ten times in a
+conversation does not leave ten photographs of your screen in a folder you have
+forgotten about.
+
+**Axon cannot show you the picture, and says so.** The voice provider speaks a
+text protocol; there is no channel on it that carries an image. So the model
+receives the structured reading, never the pixels, and the result says that
+outright rather than letting the model imply it looked at a photograph. The
+pixels are held — bound to the observation, expiring on the same clock — so a
+vision-capable consumer is a new reader rather than a redesign. Until there is
+one, this is a real limitation and it is not papered over.
+
+**There is no `mouse.click(x, y)`.** A coordinate is a target nobody can check:
+Axon cannot tell whether `940, 512` is the button you meant, a different
+button, or the taskbar, and there is no record afterwards of what was hit.
+Worse, coordinate injection acts on whatever is under the pointer *at delivery*
+— so a window that moved, a dialog that appeared, or an alt-tab between the
+decision and the click means something other than what was reasoned about
+receives it.
+
+So `ui.click` and `keyboard.type` name a reference, and the pipeline is the one
+the browser tools use:
+
+    system.screenshot → Axon enumerates and mints t1, t2, t3
+      → the model names a reference, and has no other vocabulary
+      → precheck: unknown, expired or superseded is refused, before risk
+      → risk resolved from AXON'S reading of the control's name
+      → the user is asked for anything that activates a control
+      → UI Automation invokes THAT ELEMENT, re-found by identity
+      → the controls are read again, and the result says what changed
+      → every reference from before the action is void
+
+A reference expires in fifteen seconds, is void the moment Axon acts, and
+cannot be reused. Two controls matching the same identity is a refusal, not a
+choice; none is a refusal too. **No synthetic input exists anywhere in Axon** —
+no `SendInput`, no `mouse_event`, no `keybd_event`, no `SetCursorPos` — and
+`architecture.test.ts` fails the build if any of them appears.
+
+**`keyboard.press` does not exist.** Sending Enter, Escape or a shortcut means
+synthetic keystrokes, which go to whatever holds focus — the exact race the
+design above removes, and one Axon could verify a millisecond before and still
+lose. Pressing a button is `ui.click` on that button; choosing a menu item is
+`ui.click` on the item. Submitting a form with Enter is genuinely missing, and
+is stated as missing rather than approximated.
+
+**Typing is bound to a field, and refuses credentials twice over.** The
+accessibility layer reports a protected-entry field directly, so that refusal
+is the application's own evidence rather than a guess about a field's name; and
+credential-shaped text is refused whatever field it was headed for. Neither is
+unlockable by approval. Because `SetValue` replaces a field's contents, typing
+into a field that already has something in it is HIGH_RISK and the dialog says
+so. The text is shown in the approval dialog — you cannot consent to something
+you have not read — and appears in no observation, no event and no log.
+
+## What counts as sensitive
+
+Axon classifies four things differently, because a system that calls everything
+sensitive has said nothing:
+
+| Class | Examples | What Axon does |
+|---|---|---|
+| **NORMAL** | ordinary text | handles it, no ceremony |
+| **PERSONAL** | an email address, a phone number, an address, a name | reads it, says it, types it, stores it — and *marks* it |
+| **SECRET** | passwords, API keys, tokens, card numbers, one-time codes | refuses outright; no approval unlocks it |
+| **CONSEQUENTIAL** | money, account creation, credential changes, destruction, anything sent outward | a person decides |
+
+The distinction between the middle two is the point. Earlier, Axon had one
+boolean, and it described a user's own email address as forbidden data it could
+not touch — which is untrue, and which teaches you that Axon's refusals are
+noise, so the next refusal, the one about an API key, gets read the same way.
+Policy stays in Axon: the model classifies nothing and decides nothing.
+
+## How one request runs
+
+Axon runs a REQUEST, not a sequence of tool calls. That distinction is what
+makes it behave like something you can delegate to.
+
+    user says something
+      -> a TASK opens, carrying their exact words as its goal
+      -> the model proposes ONE action
+      -> a STEP opens against the task
+      -> schema -> precheck -> budget -> risk -> policy -> duplicate
+      -> approval, when the act warrants it
+      -> execute, inside a bounded deadline
+      -> observe again, and VERIFY from what Axon can see
+      -> the result, and only then a sentence out loud
+
+Every step carries a task id and a step id, so one request can be pulled out of
+a log that holds several. The trace records the tool, the outcome, the risk
+level, whether a human was asked and whether the effect was verified — and it
+carries no arguments, no outputs and no text, because those are the things that
+must not accumulate in a log.
+
+**There is no plan and no queue.** Axon holds no list of approved future
+actions, deliberately: a queue is precisely the structure that lets one
+approval authorise the act after it. A task is a thread that steps are strung
+on, not a permission that covers them. "Open my application, fill what you can,
+but don't submit" works because filling and submitting are different acts with
+different risk, decided separately from their own arguments — not because Axon
+was told to stop before the last one.
+
+### Slow actions say so, instead of guessing
+
+Some actions take seconds. Reading the accessibility tree takes about three;
+loading a page can take longer. A tool call that has not answered leaves the
+agent composing a reply with nothing in hand — and in live testing it filled
+that gap by GUESSING, and guessed failure: *"GitHub did not load"* about a page
+that was on screen, *"I could not capture a screenshot"* about a capture that
+had succeeded. When the real result arrived, Axon corrected itself, so one
+action produced two contradictory sentences.
+
+The fix is not a better guess or a longer wait. Anything slower than about a
+second is answered `in_progress` — truthfully, since there is no outcome yet —
+and the outcome arrives afterwards as the FIRST statement anybody makes about
+what happened. There is nothing to contradict because nothing was claimed:
+
+    "One moment."          <- the in-progress answer
+    "GitHub is open."      <- the outcome
+
+And when the work beats the flush anyway, the in-progress answer is replaced by
+the real one and you hear a single sentence. The intermediate state is a
+fallback, not a ceremony — the budget is set just under the provider's own tool
+timeout so that almost everything answers inline. An acknowledgement is what
+Axon falls back to when it cannot answer in time, not something it does to seem
+responsive.
+
+### "Stop."
+
+Cancellation is matched against the user's own words, before the model sees
+them — a model asked to decide whether it has been told to stop is the thing
+being stopped. The match is deliberately strict: *"stop"*, *"cancel that"*,
+*"never mind"*, *"don't do that"* are cancellations; *"stop the video"* and
+*"cancel my subscription"* are requests. A false negative costs you saying it
+again; a false positive abandons work you wanted.
+
+Stopping reaches all of it: the task, so a result already in flight is
+recognised as unwanted and can neither speak nor prompt the next step; the
+executor, which is aborted mid-flight; the browser, which abandons the
+navigation; the observation store, so a target reference minted for the
+cancelled work cannot be acted on; and any dialog on screen, which is taken
+down rather than left for you to answer. Then Axon says one word.
+
+### Asking beats guessing
+
+Ambiguity has its own answer, separate from failure. Two Notepad windows, two
+buttons that both match — Axon does not choose, and it does not report a
+failure either, because *"I could not do that"* for something it could easily
+have done is the wrong answer. It asks which one, names the candidates, and
+waits. An application Axon does not have is likewise never the nearest one it
+does have: the tool takes an enum indexing a fixed table, so "open Chrome"
+cannot be answered by opening something similar.
+
+### Verified, or not claimed
+
+`app.open` no longer reports success from a process id. A pid means the
+operating system agreed to start something; it does not mean an application
+opened. So the launch is followed by looking — the window list is polled until
+a window the registry recognises appears, or a bounded deadline passes — and
+the result says which happened. *"Calculator is open."* is a thing Axon saw.
+
+## Doing several things
+
+A request with several parts — *"open YouTube, search for AssemblyAI Voice
+Agent, and open the first result"* — runs as one task with several steps, and
+the interesting property is not that any one step works. It is that **the third
+step depends on what the second actually produced**, not on what anybody
+intended it to produce. A search that silently did nothing cannot be followed
+by a click on a result that is not there.
+
+Nothing about having done step one makes step two legal. Each is proposed,
+schema-checked, precheck-ed, budgeted, risk-resolved, policy-decided,
+duplicate-checked, executed and verified on its own.
+
+### Where things stand
+
+People drop the subject constantly. *"Open YouTube"* then *"search for
+AssemblyAI"* then *"open the first one"* — none of those later sentences names
+what it is about, and all of them are clear to a person because they remember
+where they are.
+
+The model has the conversation, so it remembers what was **said**. What it does
+not have is what Axon **saw**. So every result carries a short grounding line —
+the page Axon actually read, and the thing it actually acted on — and the model
+resolves the reference against that. Axon supplies the facts and then validates
+whatever comes back, exactly as before; it does not resolve pronouns itself,
+because a component that resolved one could resolve one wrongly with no gate in
+between.
+
+Cancelling forgets the grounding, so *"open that one"* after a stop has nothing
+to resolve against.
+
+### Asking, and being answered
+
+When Axon asks *"Which one?"*, the next thing you say is an **answer** — it
+continues the task that asked the question rather than replacing it. That
+sounds obvious and it is the fix for a real bug: without it, *"the second one"*
+opened a brand-new task, superseding the request it was answering and throwing
+away the context that made it mean anything.
+
+Questions are as short as a question can be — *"Which one?"*, *"Open what?"*,
+*"Which application?"* — and never mention references, targets or observations.
+You are talking to an assistant, not debugging one.
+
+### "Opening YouTube."
+
+Most actions answer in one sentence. Measured on a real machine, over several
+runs: the clock is about 1ms, a verified application launch 0.9-1.5s, a screen
+observation 2.0-3.2s, a real navigation anything from under a second on a warm
+cache to many seconds cold. The threshold sits at 2.5s, which is above the
+launch and inside the spread of the other two, so:
+
+    "Open Calculator."  ->  "Calculator is open."
+    "Open YouTube."     ->  "Opening YouTube."  ...  "YouTube is open."
+
+The second line is what happens when the navigation is slow. When it is fast it
+answers in one sentence like the first, and that is the better outcome rather
+than a missed opportunity to announce.
+
+An acknowledgement is a **fallback**, not a flourish — it only happens when
+Axon would otherwise leave you in silence. And Axon supplies the words for it,
+derived from the tool and its arguments, so *"Opening YouTube"* is a statement
+of intent that is true when it is said. *"YouTube is open"* is a claim about
+the world and waits for verification.
+
+### The developer timeline
+
+For debugging a demo, the event stream projects into the shape the decisions
+actually have:
+
+    TASK task-1  "open youtube and search for assemblyai"
+    └── STEP step-1  browser.open
+        ├── proposal
+        ├── policy: SAFE — allowed without asking
+        ├── verification: confirmed by looking
+        └── SUCCEEDED
+    └── STEP step-2  browser.type
+        ├── proposal
+        ├── policy: REQUIRES_APPROVAL — a human was asked
+        ├── approval: ALLOW by user
+        ├── re-bind: fingerprint re-checked before execution
+        └── SUCCEEDED
+
+Each step is joined to its own dispatcher call by id rather than by ordering,
+so two steps of the same tool in flight at once cannot have their approvals
+swapped. It carries **no tool arguments, no page text and no typed values** —
+the shape of each decision, and none of the content.
+
+### Looking at the screen
+
+Observation is a set of providers, each of which knows two things about itself:
+whether Axon can **produce** it, and whether anything can **receive** it. Those
+are different questions, and conflating them is how a system starts claiming to
+see.
+
+| Modality | Captured | Deliverable to the model |
+|---|---|---|
+| accessibility | yes | yes — it is text |
+| pixels | yes | **no** — the protocol has no image channel |
+| vision | **no** | no — Axon has no vision model |
+
+`vision` appears in that table with "no" rather than being left out, because a
+missing row reads as an oversight and a "no" reads as a decision. There is no
+`VisionObservationProvider` file, class or stub: one that returned "a
+description of the image" without a vision model behind it would read exactly
+like sight and be a guess.
+
+## Giving the demo
+
+The stage script lives in [docs/DEMO.md](docs/DEMO.md), and it is generated from
+the same data the suite performs — so the document cannot describe a demo the
+product can no longer give. Four commands, in the order you use them:
+
+```bash
+npm run preflight
+```
+
+Thirteen checks against the real runtime on this machine — the key (by name,
+never by value), whether the network lets Axon reach the voice provider, the
+microphone permission, the speech engine, the wake word, the policy, the
+browser, UI Automation, the task ledger and the approval broker. It ends in
+`READY FOR DEMO` or says what is not.
+
+```bash
+npm run rehearse
+```
+
+The canonical demo, beat by beat, through the real orchestrator, tool bridge,
+dispatcher, policy and approval broker, with the model and the internet
+replaced by a script and page models. It prints a record: every sentence,
+every proposal, the policy verdict, the approval, the time taken, and what Axon
+was told to say.
+
+```bash
+npm run attacks
+```
+
+Nine attempts to make Axon do something it should not — a shell, a private
+file, a write outside the workspace, an invented tool, a password into a form,
+a page announcing that approval is off, a detour to a signup page, an approval
+answered for a different act than the one shown — and what happened to each.
+None is allowed. Put it on a second screen.
+
+```powershell
+$env:AXON_DEMO_RECORDING='1'; npm run dev
+```
+
+A development build that writes `logs/demo-recording.jsonl` on quit: one row
+per step with its time, tool, status, latency, policy, approval and
+verification, and none of the content — no arguments, no page text, no typed
+values, no keys, no audio.
 
 ## Known limitations
 
@@ -790,6 +1279,129 @@ guarantee about everything you might type.
 derived from its first user message, not written by the model. It is cheap,
 deterministic and offline, and it is sometimes a poor description of where the
 conversation ended up.
+
+**Axon cannot see the picture it captured.** The visual-observation abstraction
+holds the pixels and expires them, but there is no consumer that can accept an
+image: the voice provider's protocol carries text. What the model reasons about
+is the accessibility reading, which is a good description of a well-behaved
+application and says nothing at all about one that draws its own interface.
+
+**Some applications expose nothing to act on.** Games, canvas-based editors and
+anything that paints its own controls publish no accessibility tree, so Axon
+sees a window with no controls in it. It reports that honestly rather than
+returning an empty list a model would read as "the screen is empty" — but the
+consequence is real: Axon cannot click inside those applications at all, and
+adding coordinates to reach them would give up the entire safety argument.
+
+**Reading the accessibility tree takes seconds.** A large window can hold
+thousands of nodes, and the walk is bounded at six seconds so a look at the
+screen fits inside the voice provider's tool timeout. A window that cannot be
+walked in that time yields a partial reading, reported as partial.
+
+**No `keyboard.press`, so nothing can be submitted with Enter.** See the
+section above for why this was left out rather than approximated.
+
+**Tool deadlines are tied to the voice protocol.** Every per-call deadline has
+to fit inside the provider's tool timeout, or the provider abandons the call
+and the model reports a failure for work that succeeded — which happened in a
+live test, with Axon announcing that GitHub had not loaded while the page was
+on screen. `voice-agent-timing.test.ts` now asserts the relationship, but the
+underlying constraint is real: Axon cannot wait longer for a page than the
+conversation will wait for Axon.
+
+**The goal boundary trusts the provider's transcription.** The goal a
+navigation is judged against comes from `transcript.user` — the voice
+provider's transcription of what you said. Axon does not transcribe the
+streamed audio itself, so a provider sending a fabricated transcript could set
+a goal you never spoke. What that could achieve is bounded: the boundary only
+ever ESCALATES, so a fabricated goal cannot make an action skip the risk
+policy, the approval gate, the duplicate guard or the budget, and it can name
+no tool, path or URL. What it could do is stop Axon asking about a
+consequential navigation it would otherwise have asked about. Fixing it needs a
+local transcription of the same audio to compare against, which is a milestone
+rather than a patch.
+
+**A very slow action costs an extra sentence.** Anything past the inline budget
+is acknowledged first and answered second, so you hear "One moment." and then
+the result. The budget is set just under the provider's tool timeout precisely
+so this is rare — in live testing every ordinary request answers in one
+sentence — but a navigation to a slow site can still take two utterances. That
+is the price of never hearing a guess, and it is the right trade.
+
+**Cancellation matching is strict, and English-only.** The phrase list is
+literal and short. Saying "stop" in another language, or phrasing it unusually,
+will not cancel — you will have to say it again in a way the list recognises,
+or close the session.
+
+**Reference resolution is the model's, not Axon's.** Axon supplies the facts —
+which page it read, what it acted on — and the model decides that "it" means
+YouTube. That is the right split (language is the model's job, and a component
+that resolved references could resolve one wrongly with no gate in between),
+but it means a reference can be resolved wrongly by a confused model. What
+bounds the damage is that the resulting action is validated like any other: a
+wrong reference produces a refused or approved action, never a silent one.
+
+**A clarifying answer is whatever you say next.** Axon treats the next
+utterance after a question as the answer to it. If you ask something unrelated
+instead, that sentence is absorbed as the answer and the task carries on with
+it — one utterance clears the state, so the one after that starts fresh, but
+the first one is misread.
+
+**Searching asks for approval.** Submitting anything — including a search box —
+sends data to somebody else's server, so it goes through the approval gate.
+That is correct and it is one dialog in the middle of the YouTube demo. It is
+not special-cased away, because "it is only a search" is exactly the reasoning
+that would eventually wave through something that is not.
+
+**A synthesised voice is not a person.** `wake-integration.test.ts` runs the
+real Windows engine on a synthesised voice and passes "Hey / Hello / Hi Axon"
+while refusing thirteen negatives, including "I was talking about Axon
+yesterday", "Axon is a company", "action", "exon", "song", and the phrases a
+human microphone test produced under the old design ("But who", "And who",
+"New song"). That is not a measurement of your voice: the design that passed
+synthesised speech before failed a person. The wake phrase is only proven by
+`npm run wake:live` with repeated runs, spoken by you. Acoustic loopback (the
+laptop speaking into its own microphone) does not work on hardware whose
+microphone driver cancels echo, which includes the machine this was built on.
+
+**Act III of the demo needs a real, hosted page.** The rehearsed application
+form lives at `careers.example.com`, which exists only inside the test suite.
+The same page is in `demo-site/` as static files; host it on any public https
+address (Axon refuses localhost and private addresses, and that is not relaxed
+for a demo), and say its address on stage — Axon cannot know where "my
+internship application" is. `verify-agent.cjs` runs Act III against those exact
+files in the real browser.
+
+**The live web is not the rehearsal.** On real YouTube, Axon asks "which one?"
+only if two results are genuinely indistinguishable, which is uncommon, and a
+search asks for approval only if the model types into the search box and
+submits — opening a results address directly is a page load and asks nothing.
+A third path was seen live too: the model typed the query and then clicked
+YouTube's search icon, which is a script-driven button rather than a form
+submission, so Axon classified it as an ordinary click and asked nothing.
+Axon asks before real form submissions and consequential destinations; it
+cannot tell that an arbitrary script button sends what was typed. The approval
+that is guaranteed is the one that matters: submitting the application.
+
+**On a slow network the model can speak before the outcome.** A navigation
+that runs past the inline budget is answered "in progress", with an explicit
+instruction not to claim success or failure. In one live run an 11.5-second
+navigation still drew "GitHub is open." from the model before Axon's verified
+outcome — "GitHub did not load, so I stopped." — followed. The last word is
+Axon's and it is true; the first sentence was the model guessing. The live
+smoke test checks for exactly this and reports it as a failure when it happens.
+
+**A slow page load can occasionally go unannounced.** When a navigation takes
+longer than the inline budget, the agent is told "Opening YouTube." and the
+outcome follows as a separate reply. In live runs that second reply was
+sometimes not spoken — the page was open and nothing was said. A change that
+held the outcome until the acknowledgement finished was tried and made live
+runs worse, so it was reverted rather than tuned blind.
+
+**A rehearsal is not a live run.** `npm run rehearse` proves the pipeline holds
+for the stage sequence; it does not prove the model proposes that sequence.
+`npm run smoke:assemblyai` is that evidence, against the real provider, and the
+two are never reported as one.
 
 ## Licence
 
