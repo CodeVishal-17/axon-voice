@@ -261,7 +261,41 @@ export interface DesktopUi {
   observeControls(windowHandle: string | null, options?: ObserveOptions): Promise<DesktopScreenReading>;
   /** Act on exactly one control, re-found by identity. */
   actOnControl(request: DesktopControlRequest): Promise<DesktopControlOutcome>;
+  /** A browser window's web page: title, address, bounded text (Browser control plane). Optional. */
+  readPage?(windowHandle: string): Promise<WebPageReading>;
+  /** Scroll that page by one screen, re-found by identity. Optional. */
+  scrollPage?(windowHandle: string, page: WebPageIdentity, direction: 'down' | 'up'): Promise<DesktopControlOutcome>;
 }
+
+/** Which page, as the engine found it. INTERNAL: never shown to a model. */
+export interface WebPageIdentity {
+  readonly title: string;
+  readonly automationId: string;
+  readonly runtimeId: string;
+}
+
+/** The web page in a browser window, or why there is none. Every string is UNTRUSTED page content. */
+export type WebPageReading =
+  | {
+      readonly kind: 'page';
+      readonly title: string;
+      readonly url: string;
+      /** Bounded; null where the page offers no text. */
+      readonly text: string | null;
+      /** Vertical position 0–100, or null where the page does not scroll. */
+      readonly scroll: number | null;
+      readonly identity: WebPageIdentity;
+      /**
+       * The window the page's accessibility actually lives in — the browser
+       * window itself, or Chromium's render widget inside it. INTERNAL: every
+       * read, act and scroll on this page goes through it; no model sees it.
+       */
+      readonly surface: string;
+    }
+  | { readonly kind: 'none'; readonly reason: 'no-page' | 'gone' | 'failed' | 'unavailable' };
+
+/** Characters of page text one read carries. Bounded here and again in the engine. */
+export const MAX_PAGE_TEXT = 20_000;
 
 /**
  * The program.
@@ -467,7 +501,7 @@ const MAX_TITLE = 160;
 
 /** What the accessibility program is asked, out of band. */
 export interface UiInvocation {
-  readonly mode: 'observe' | 'act';
+  readonly mode: 'observe' | 'act' | 'page';
   /** Empty means the foreground window. */
   readonly windowHandle: string;
   readonly maxElements: number;
@@ -669,7 +703,9 @@ export class WindowsDesktop implements DesktopWindows, DesktopUi, DesktopApps {
             max: invocation.maxElements,
             ...(document ? { scope: document } : {}),
           }
-        : { op: 'act', window: invocation.windowHandle, target: document ?? {} },
+        : invocation.mode === 'page'
+          ? { op: 'page', window: invocation.windowHandle, max: invocation.maxElements }
+          : { op: 'act', window: invocation.windowHandle, target: document ?? {} },
       timeoutMs,
     );
     const { id: _id, ...result } = answer;
@@ -723,6 +759,39 @@ export class WindowsDesktop implements DesktopWindows, DesktopUi, DesktopApps {
       return { kind: 'failed', reason: 'timeout' };
     }
 
+    return parseOutcome(raw);
+  }
+
+  async readPage(windowHandle: string): Promise<WebPageReading> {
+    if (!this.uiAvailable) return { kind: 'none', reason: 'unavailable' };
+    if (!HANDLE_PATTERN.test(windowHandle)) return { kind: 'none', reason: 'failed' };
+    let raw: string;
+    try {
+      raw = await this.runUi({ mode: 'page', windowHandle, maxElements: MAX_PAGE_TEXT, target: '' }, OBSERVATION_LIMITS.enumerateTimeoutMs);
+    } catch {
+      return { kind: 'none', reason: 'failed' };
+    }
+    return parsePage(raw);
+  }
+
+  async scrollPage(windowHandle: string, page: WebPageIdentity, direction: 'down' | 'up'): Promise<DesktopControlOutcome> {
+    if (!this.uiAvailable) return { kind: 'failed', reason: 'not-available' };
+    if (!HANDLE_PATTERN.test(windowHandle)) return { kind: 'failed', reason: 'bad-window' };
+    if (direction !== 'down' && direction !== 'up') return { kind: 'failed', reason: 'bad-action' };
+    const target = JSON.stringify({
+      role: 'ControlType.Document',
+      name: page.title,
+      automationId: page.automationId,
+      ...(RUNTIME_ID_PATTERN.test(page.runtimeId) ? { runtimeId: page.runtimeId } : {}),
+      action: direction === 'down' ? 'scrollDown' : 'scrollUp',
+      text: '',
+    });
+    let raw: string;
+    try {
+      raw = await this.runUi({ mode: 'act', windowHandle, maxElements: OBSERVATION_LIMITS.maxTargets, target }, OBSERVATION_LIMITS.actTimeoutMs);
+    } catch {
+      return { kind: 'failed', reason: 'timeout' };
+    }
     return parseOutcome(raw);
   }
 
@@ -1030,6 +1099,48 @@ export function parseOutcome(raw: string): DesktopControlOutcome {
  * string, in the same order. An embedded right-to-left override makes those
  * two things differ while looking identical.
  */
+/**
+ * Chromium's object-replacement character (U+FFFC), which its page text
+ * carries wherever an image or widget sits: noise to a reader. Built from its
+ * code point so the source holds no invisible character.
+ */
+const OBJECT_REPLACEMENT = new RegExp(String.fromCharCode(0xfffc), 'g');
+
+/** The engine's page answer, validated. Text is sanitised and bounded; nothing is trusted. */
+export function parsePage(raw: string): WebPageReading {
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return { kind: 'none', reason: 'failed' };
+  }
+  if (value.error === 'no-page') return { kind: 'none', reason: 'no-page' };
+  if (value.error === 'gone') return { kind: 'none', reason: 'gone' };
+  if (typeof value.error === 'string' || typeof value.url !== 'string' || !/^https?:\/\//i.test(value.url)) return { kind: 'none', reason: 'failed' };
+  const runtimeId = typeof value.runtimeId === 'string' && RUNTIME_ID_PATTERN.test(value.runtimeId) ? value.runtimeId : '';
+  if (typeof value.surface !== 'string' || !HANDLE_PATTERN.test(value.surface) || value.surface === '0') return { kind: 'none', reason: 'failed' };
+  const surface = value.surface;
+  const scroll = typeof value.scroll === 'number' && value.scroll >= 0 && value.scroll <= 100 ? Math.round(value.scroll) : null;
+  // Line breaks are kept (they are the page's structure); other control characters are not.
+  const text =
+    typeof value.text === 'string'
+      ? value.text.replace(/\r\n?/g, '\n').replace(OBJECT_REPLACEMENT, '').replace(CONTROL_CHARACTERS, ' ').replace(/[ \t]+/g, ' ').replace(/\n\s*\n\s*\n+/g, '\n\n').trim().slice(0, MAX_PAGE_TEXT)
+      : null;
+  return {
+    kind: 'page',
+    title: sanitizeTitle(typeof value.title === 'string' ? value.title : ''),
+    url: value.url.slice(0, 2048),
+    text,
+    scroll,
+    surface,
+    identity: {
+      title: typeof value.title === 'string' ? value.title.slice(0, 1024) : '',
+      automationId: typeof value.automationId === 'string' ? value.automationId.slice(0, 512) : '',
+      runtimeId,
+    },
+  };
+}
+
 function sanitizeText(value: unknown, limit: number): string {
   if (typeof value !== 'string') return '';
   return value

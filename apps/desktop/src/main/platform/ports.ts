@@ -30,6 +30,27 @@ export interface AppLauncher {
   launchStartMenuApp?(appId: string): Promise<void>;
 }
 
+/**
+ * The clipboard, for one purpose: handing Paint a picture to paste (Drawing).
+ *
+ * `save` takes what the user had on the clipboard so `restore` can put it
+ * back when the drawing is done. What is saved stays in memory, opaque to
+ * every caller: it is never read, logged or sent anywhere.
+ */
+export interface ClipboardImages {
+  save(): Promise<ClipboardSnapshot>;
+  restore(snapshot: ClipboardSnapshot): Promise<void>;
+  clear(): Promise<void>;
+  writePng(png: Uint8Array): Promise<void>;
+  /** The image on the clipboard, as RGBA pixels, or null when there is none. */
+  readImage(): Promise<{ readonly width: number; readonly height: number; readonly rgba: Uint8Array } | null>;
+}
+
+/** Opaque: only `restore` knows what is inside. */
+export interface ClipboardSnapshot {
+  readonly __clipboardSnapshot: true;
+}
+
 export interface CapturedScreen {
   readonly png: Uint8Array;
   readonly width: number;

@@ -70,6 +70,7 @@ import {
   DEFERRED_TOOL_RESULT,
   FAILURE_GUIDANCE,
   IN_PROGRESS_TOOL_RESULT,
+  PAGE_STEP_TOOLS,
   TASK_LIMITS,
   describeProgress,
   VOICE_AGENT_LIMITS,
@@ -443,7 +444,10 @@ export class ToolBridge {
     const raced = await Promise.race([
       work,
       new Promise<typeof deadline>((resolve) => {
-        const timer = setTimeout(() => resolve(deadline), this.inlineBudgetMs);
+        // Page steps wait longer inline: the model can only take the next step
+        // of a browse from a result it holds (`TASK_LIMITS.pageInlineBudgetMs`).
+        const budget = PAGE_STEP_TOOLS.has(name) ? Math.max(this.inlineBudgetMs, TASK_LIMITS.pageInlineBudgetMs) : this.inlineBudgetMs;
+        const timer = setTimeout(() => resolve(deadline), budget);
         if (typeof timer.unref === 'function') timer.unref();
       }),
     ]);

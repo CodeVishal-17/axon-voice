@@ -35,9 +35,10 @@ import { targetVersion as schemaTarget } from './persistence/migrations.js';
 import { resolveRuntimeConfig, type ConfigInputs, type RuntimeConfig } from './config.js';
 import { AxonBrowser } from './browser/axon-browser.js';
 import { Orchestrator } from './orchestrator/orchestrator.js';
-import { ElectronAppLauncher, ElectronScreenCapturer } from './platform/electron-platform.js';
+import { ElectronAppLauncher, ElectronClipboard, ElectronScreenCapturer } from './platform/electron-platform.js';
 import { WindowsDesktop } from './platform/windows-desktop.js';
 import { AppCatalog } from './apps/app-catalog.js';
+import { DrawingStore } from './draw/artifact-store.js';
 import { VisualObservationStore } from './screen/visual-observation.js';
 import { createDefaultRegistry } from './tools/registry.js';
 import { createTextToSpeech } from './voice/create-tts.js';
@@ -309,6 +310,11 @@ export function createAxonRuntime(inputs: RuntimeInputs): AxonRuntime {
     // Installed-application discovery and the default browser.
     apps: desktop,
     catalog,
+    // Drawing. The clipboard is how each step reaches Paint. No image service is configured — there is no provider in this
+    // repository — so `imageProvider` is null and `draw.generate` says so.
+    drawing: config.drawEnabled
+      ? { store: new DrawingStore(config.drawingsDir), imageProvider: null, clipboard: new ElectronClipboard() }
+      : null,
   });
 
   // The upgrade Step 2 predicted, and it really is one line: the same `Memory`

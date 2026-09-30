@@ -166,14 +166,23 @@ async function main() {
       // A read-only question to the real policy: would submitting text need a
       // human? The ANSWER is the check — a policy that is not loaded cannot
       // answer, and one that answered "no" here would be the wrong policy.
-      const needsApproval = orchestrator.dispatcher.requiresApproval('browser.type', {
-        ref: 'e1',
-        text: 'preflight',
-        submit: true,
+      //
+      // Asked about SAVING A MEMORY, not a browser submit: a submit needs an
+      // element reference from a page read, and with no page read the
+      // dispatcher's precheck refuses it before the policy is ever asked — so
+      // that probe reported FAIL on a healthy policy. And the tool must really
+      // be registered: `requiresApproval` answers yes for an unknown tool,
+      // which would make this check pass on nothing.
+      const registered = orchestrator.listTools().some((tool) => tool.name === 'memory.save');
+      if (!registered) return { status: 'FAIL', detail: 'memory.save is not registered, so the policy could not be asked' };
+      const needsApproval = orchestrator.dispatcher.requiresApproval('memory.save', {
+        category: 'preference',
+        key: 'preflight',
+        value: 'preflight',
       });
       return needsApproval
-        ? { status: 'OK', detail: 'submitting text still asks a human' }
-        : { status: 'FAIL', detail: 'the policy did not ask for approval on a submit' };
+        ? { status: 'OK', detail: 'a consequential act still asks a human' }
+        : { status: 'FAIL', detail: 'the policy did not ask for approval on a consequential act' };
     },
 
     Browser: () => {

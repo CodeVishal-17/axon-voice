@@ -26,7 +26,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { BROWSING_LIMITS, OBSERVATION_LIMITS, TASK_LIMITS, VOICE_AGENT_LIMITS } from '@axon/core';
+import { BROWSING_LIMITS, OBSERVATION_LIMITS, PAGE_STEP_TOOLS, TASK_LIMITS, VOICE_AGENT_LIMITS } from '@axon/core';
 
 /** What the provider allows one tool call, in milliseconds. */
 const WIRE_TIMEOUT_MS = VOICE_AGENT_LIMITS.toolTimeoutSeconds * 1_000;
@@ -96,6 +96,14 @@ describe('every tool deadline fits inside the voice provider’s tool timeout', 
     // reached by a longer route: the agent composes a reply with nothing in
     // hand and guesses.
     expect(TASK_LIMITS.inlineBudgetMs + OVERHEAD_MS).toBeLessThanOrEqual(WIRE_TIMEOUT_MS);
+  });
+
+  it('lets a page step wait longer inline, and still answer before the wire gives up', () => {
+    // Browsing is a chain the model can only continue from a result it holds.
+    expect(TASK_LIMITS.pageInlineBudgetMs).toBeGreaterThan(TASK_LIMITS.inlineBudgetMs);
+    expect(TASK_LIMITS.pageInlineBudgetMs + OVERHEAD_MS).toBeLessThanOrEqual(WIRE_TIMEOUT_MS);
+    // Only the page steps: every other tool keeps the short budget.
+    expect([...PAGE_STEP_TOOLS].sort()).toEqual(['web.click', 'web.find', 'web.read', 'web.scroll', 'web.type']);
   });
 
   it('sets the threshold where trivial work and a real pause actually separate', () => {

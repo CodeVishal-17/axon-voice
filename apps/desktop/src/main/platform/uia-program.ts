@@ -22,8 +22,10 @@
  *   ping      answer, so the caller knows the engine compiled and COM works
  *   observe   one window's controls: a page of them, optionally only beneath
  *             one control Axon already described
- *   act       one of invoke / toggle / select / expand / setText / focus, on
- *             one control re-found by identity
+ *   act       one of invoke / toggle / select / expand / setText / focus /
+ *             scrollDown / scrollUp, on one control re-found by identity
+ *   page      a browser window's web page: its title, its address, and its
+ *             text, bounded (the Document's own Value and Text patterns)
  *
  * It reads requests as JSON lines on STDIN and answers on STDOUT. There is no
  * socket, no port, no pipe name another process could open: stdin and stdout
@@ -119,13 +121,19 @@ namespace AxonUia {
   public interface IUIAutomationSelectionItemPattern { [PreserveSig] int Select(); }
   [ComImport, Guid("619be086-1f4e-4ee4-bafa-210128738730"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   public interface IUIAutomationExpandCollapsePattern { [PreserveSig] int Expand(); [PreserveSig] int Collapse(); }
+  [ComImport, Guid("32eba289-3583-42c9-9c59-3b6d9a1e9b6a"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IUIAutomationTextPattern { void _RangeFromPoint(); void _RangeFromChild(); void _GetSelection(); void _GetVisibleRanges(); [PreserveSig] int get_DocumentRange(out IUIAutomationTextRange range); }
+  [ComImport, Guid("a543cc6a-f4ae-494b-8239-c814481187a8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IUIAutomationTextRange { void _Clone(); void _Compare(); void _CompareEndpoints(); void _ExpandToEnclosingUnit(); void _FindAttribute(); void _FindText(); void _GetAttributeValue(); void _GetBoundingRectangles(); void _GetEnclosingElement(); [PreserveSig] int GetText(int max, [MarshalAs(UnmanagedType.BStr)] out string text); }
+  [ComImport, Guid("88f4d42a-e881-459d-a77c-73bbbb7e02dc"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IUIAutomationScrollPattern { [PreserveSig] int Scroll(int h, int v); void _SetScrollPercent(); void _H(); [PreserveSig] int get_CurrentVerticalScrollPercent(out double v); }
 
   public static class Engine {
     const int Descendants = 4, MaxVisits = 40000, BudgetMs = 4000;
     const int P_RuntimeId = 30000, P_Type = 30003, P_Name = 30005, P_Focusable = 30009, P_Enabled = 30010, P_Id = 30011, P_Class = 30012,
       P_Password = 30019, P_Offscreen = 30022, P_Invoke = 30031, P_Select = 30036, P_Expand = 30028, P_Toggle = 30041,
       P_Value = 30043, P_ValueValue = 30045, P_ReadOnly = 30046;
-    const int Pat_Invoke = 10000, Pat_Value = 10002, Pat_Expand = 10005, Pat_Select = 10010, Pat_Toggle = 10015;
+    const int Pat_Invoke = 10000, Pat_Value = 10002, Pat_Scroll = 10004, Pat_Expand = 10005, Pat_Select = 10010, Pat_Text = 10014, Pat_Toggle = 10015;
     const string CUIAutomation = "ff48dba4-60ef-4201-aa87-54103eef594e";
 
     // Control types Axon names, by UIA id. Interactive ones map to a role; the
@@ -143,6 +151,15 @@ namespace AxonUia {
     static readonly HashSet<int> Containers = new HashSet<int> { 50008, 50009, 50018, 50021, 50023, 50026, 50028, 50030, 50033, 50036 };
 
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    delegate bool ChildProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, ChildProc f, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+    // Chromium's page surfaces inside a browser window: where its page accessibility lives when the shell does not parent it.
+    static List<long> Surfaces(long hwnd) {
+      var r = new List<long>();
+      EnumChildWindows(new IntPtr(hwnd), (h, l) => { var c = new System.Text.StringBuilder(64); GetClassName(h, c, 64); if (c.ToString() == "Chrome_RenderWidgetHostHWND") r.Add(h.ToInt64()); return true; }, IntPtr.Zero);
+      return r;
+    }
     public static long Foreground() { return GetForegroundWindow().ToInt64(); }
 
     static IUIAutomation automation;
@@ -320,6 +337,30 @@ namespace AxonUia {
       return r;
     }
 
+    static string ValueOf(IUIAutomationElement e) { object v; string s; return e.GetCurrentPattern(Pat_Value, out v) >= 0 && v != null && ((IUIAutomationValuePattern)v).get_CurrentValue(out s) >= 0 ? s : null; }
+
+    // The web page in a browser window: the first Document whose Value is an http(s) address. Read-only.
+    public static Dictionary<string, object> Page(long hwnd, int max) {
+      var r = new Dictionary<string, object>();
+      if (Root(hwnd) == null) { r["error"] = "gone"; return r; }
+      IUIAutomationElement doc = null; string url = null; long surface = 0; int visited; bool exhausted;
+      var tries = new List<long> { hwnd }; tries.AddRange(Surfaces(hwnd));
+      foreach (long h in tries) {
+        IUIAutomationElement root = Root(h); if (root == null) continue;
+        Walk(root, e => { if (TypeOf(e) != 50030) return true; string u = ValueOf(e); if (u == null || !Regex.IsMatch(u, "^https?://", RegexOptions.IgnoreCase)) return true; doc = e; url = u; return false; }, out visited, out exhausted);
+        if (doc != null) { surface = h; break; }
+      }
+      if (doc == null) { r["error"] = "no-page"; return r; }
+      r["surface"] = surface.ToString();
+      r["title"] = Text(doc, P_Name); r["url"] = url; r["runtimeId"] = RuntimeId(doc); r["automationId"] = Text(doc, P_Id);
+      object p; string text = null; IUIAutomationTextRange range;
+      if (doc.GetCurrentPattern(Pat_Text, out p) >= 0 && p != null && ((IUIAutomationTextPattern)p).get_DocumentRange(out range) >= 0 && range != null) range.GetText(max, out text);
+      r["text"] = text;
+      double pos = -1; if (doc.GetCurrentPattern(Pat_Scroll, out p) >= 0 && p != null) ((IUIAutomationScrollPattern)p).get_CurrentVerticalScrollPercent(out pos);
+      r["scroll"] = pos;
+      return r;
+    }
+
     public static Dictionary<string, object> Act(long hwnd, Dictionary<string, object> target) {
       var r = new Dictionary<string, object>();
       IUIAutomationElement root = Root(hwnd);
@@ -336,6 +377,7 @@ namespace AxonUia {
         case "select": hr = e.GetCurrentPattern(Pat_Select, out pattern); if (hr < 0 || pattern == null) goto unsupported; hr = ((IUIAutomationSelectionItemPattern)pattern).Select(); break;
         case "expand": hr = e.GetCurrentPattern(Pat_Expand, out pattern); if (hr < 0 || pattern == null) goto unsupported; hr = ((IUIAutomationExpandCollapsePattern)pattern).Expand(); break;
         case "focus": hr = e.SetFocus(); break;
+        case "scrollDown": case "scrollUp": hr = e.GetCurrentPattern(Pat_Scroll, out pattern); if (hr < 0 || pattern == null) goto unsupported; hr = ((IUIAutomationScrollPattern)pattern).Scroll(2, action == "scrollDown" ? 3 : 0); break;
         case "setText": {
           hr = e.GetCurrentPattern(Pat_Value, out pattern); if (hr < 0 || pattern == null) goto unsupported;
           var value = (IUIAutomationValuePattern)pattern; int readOnly;
@@ -361,7 +403,7 @@ namespace AxonUia {
     static readonly Regex RequestId = new Regex("^[A-Za-z0-9-]{1,64}$");
     static readonly Regex Handle = new Regex("^[0-9]{0,19}$");
     static readonly Regex Runtime = new Regex("^[0-9-]{1,11}(\\.[0-9-]{1,11}){0,15}$");
-    static readonly HashSet<string> Actions = new HashSet<string> { "invoke", "toggle", "select", "expand", "setText", "focus" };
+    static readonly HashSet<string> Actions = new HashSet<string> { "invoke", "toggle", "select", "expand", "setText", "focus", "scrollDown", "scrollUp" };
 
     public static void Serve() {
       var json = new JavaScriptSerializer(); json.MaxJsonLength = 8 * 1024 * 1024;
@@ -444,6 +486,11 @@ namespace AxonUia {
           Dictionary<string, object> target;
           if (!Identity(targetValue, true, out target)) return Fail(id, "invalid");
           result = Engine.Act(hwnd, target);
+        } else if ((op as string) == "page") {
+          object maxValue; request.TryGetValue("max", out maxValue);
+          int max = Integer(maxValue, 1, 60000, 20000);
+          if (max == int.MinValue) return Fail(id, "invalid");
+          result = Engine.Page(hwnd, max);
         } else {
           return Fail(id, "unknown-op");
         }

@@ -60,7 +60,8 @@ export type UiaRequest =
       readonly max: number;
       readonly scope?: Readonly<Record<string, string>>;
     }
-  | { readonly op: 'act'; readonly window: string; readonly target: Readonly<Record<string, string>> };
+  | { readonly op: 'act'; readonly window: string; readonly target: Readonly<Record<string, string>> }
+  | { readonly op: 'page'; readonly window: string; readonly max: number };
 
 /** The longest answer accepted: 60 controls with bounded names are far below this. */
 export const MAX_ANSWER_CHARS = 2 * 1024 * 1024;

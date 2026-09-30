@@ -13,8 +13,8 @@
  */
 
 import { spawn } from 'node:child_process';
-import { desktopCapturer, screen, shell } from 'electron';
-import type { AppLauncher, CapturedScreen, LaunchedApp, ScreenCapturer } from './ports.js';
+import { ClipboardItem, clipboard, desktopCapturer, nativeImage, screen, shell } from 'electron';
+import type { AppLauncher, CapturedScreen, ClipboardImages, ClipboardSnapshot, LaunchedApp, ScreenCapturer } from './ports.js';
 // The one definition of what may reach explorer; see `app-catalog.ts`.
 import { isLaunchableAppId } from '../apps/app-catalog.js';
 
@@ -88,6 +88,65 @@ export class ElectronAppLauncher implements AppLauncher {
   }
 }
 
+
+/**
+ * The clipboard, through Electron's (W3C-shaped) clipboard API.
+ *
+ * MEASURED on Electron 44: `writeImage` no longer exists in the main process;
+ * `write([new ClipboardItem({ 'image/png': Blob })])` puts PNG, Bitmap and
+ * DeviceIndependentBitmap on the Windows clipboard, which is what Paint's
+ * Paste reads. `read()` returns items that can be written back as they came,
+ * which is how the user's clipboard is restored.
+ */
+export class ElectronClipboard implements ClipboardImages {
+  async save(): Promise<ClipboardSnapshot> {
+    let items: ClipboardItem[] = [];
+    try {
+      items = await clipboard.read();
+    } catch {
+      items = [];
+    }
+    return { __clipboardSnapshot: true, items } as ClipboardSnapshot;
+  }
+
+  async restore(snapshot: ClipboardSnapshot): Promise<void> {
+    const items = (snapshot as unknown as { items?: ClipboardItem[] }).items ?? [];
+    if (items.length === 0) {
+      await clipboard.clear();
+      return;
+    }
+    await clipboard.write(items);
+  }
+
+  async clear(): Promise<void> {
+    await clipboard.clear();
+  }
+
+  async writePng(png: Uint8Array): Promise<void> {
+    await clipboard.write([new ClipboardItem({ 'image/png': new Blob([Buffer.from(png)], { type: 'image/png' }) })]);
+  }
+
+  async readImage(): Promise<{ width: number; height: number; rgba: Uint8Array } | null> {
+    const items = await clipboard.read();
+    const item = items.find((entry) => entry.types.includes('image/png'));
+    if (!item) return null;
+    const blob = (await item.getType('image/png')) as Blob;
+    const image = nativeImage.createFromBuffer(Buffer.from(await blob.arrayBuffer()));
+    if (image.isEmpty()) return null;
+    const { width, height } = image.getSize();
+    // `toBitmap` is BGRA on Windows; swapped to RGBA here so nothing above
+    // this port has to know.
+    const bgra = image.toBitmap();
+    const rgba = new Uint8Array(bgra.length);
+    for (let index = 0; index + 3 < bgra.length; index += 4) {
+      rgba[index] = bgra[index + 2]!;
+      rgba[index + 1] = bgra[index + 1]!;
+      rgba[index + 2] = bgra[index]!;
+      rgba[index + 3] = bgra[index + 3]!;
+    }
+    return { width, height, rgba };
+  }
+}
 
 export class ElectronScreenCapturer implements ScreenCapturer {
   async capturePrimaryDisplay(): Promise<CapturedScreen> {

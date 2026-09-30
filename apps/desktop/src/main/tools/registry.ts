@@ -24,6 +24,7 @@ import { createScreenshotTool } from './executors/system-screenshot.js';
 import { createSystemTimeTool } from './executors/system-time.js';
 import { createKeyboardTypeTool, createUiClickTool } from './executors/ui-input.js';
 import { createUiReadTool } from './executors/ui-read.js';
+import { createWebPageTools } from './executors/web-page.js';
 import {
   createBrowserBackTool,
   createBrowserClickTool,
@@ -49,6 +50,10 @@ import type { PathPolicy } from './executors/paths.js';
 import type { PersistenceService } from '../persistence/persistence-service.js';
 import type { DesktopApps, DesktopUi, DesktopWindows } from '../platform/windows-desktop.js';
 import type { AppCatalog } from '../apps/app-catalog.js';
+import type { DrawingStore } from '../draw/artifact-store.js';
+import type { ImageProvider } from '../draw/image-provider.js';
+import type { ClipboardImages } from '../platform/ports.js';
+import { createDrawGenerateTool, createDrawPaintTool } from './executors/draw.js';
 import { VisualObservationStore } from '../screen/visual-observation.js';
 
 export class ToolRegistry {
@@ -123,6 +128,17 @@ export interface RegistryDependencies {
    * `app.focus` search by name — never a list of things Axon trusts.
    */
   readonly catalog?: AppCatalog | null;
+  /**
+   * Drawing (`AXON_DRAW_ENABLED`). Absent or null: no drawing tools at all.
+   * `imageProvider` null means no image service is configured, and
+   * `draw.generate` says exactly that.
+   */
+  readonly drawing?: {
+    readonly store: DrawingStore;
+    readonly imageProvider: ImageProvider | null;
+    /** For pasting each step into Paint. Absent: no `draw.paint`. */
+    readonly clipboard?: ClipboardImages | null;
+  } | null;
 }
 
 /** The tools Axon ships with today. */
@@ -157,6 +173,20 @@ export function createDefaultRegistry(deps: RegistryDependencies): ToolRegistry 
     createWebOpenTool(deps.launcher, { apps: deps.apps ?? null, catalog, desktop: deps.desktop ?? null }),
   );
   registry.register(createSystemTimeTool());
+
+  // Drawing: Axon draws in a new Paint window, one fixed step at a time, and
+  // a description-to-image tool that says plainly when no image service is
+  // configured. Paint needs the catalog, a way to start it, the window list,
+  // the accessibility layer and the clipboard; without all of them, only
+  // `draw.generate` is offered.
+  const drawing = deps.drawing ?? null;
+  if (drawing) {
+    registry.register(createDrawGenerateTool({ store: drawing.store, provider: drawing.imageProvider }));
+    const desktop = deps.desktop?.available ? deps.desktop : null;
+    if (catalog && ui && desktop && drawing.clipboard && deps.launcher.launchStartMenuApp) {
+      registry.register(createDrawPaintTool({ catalog, launcher: deps.launcher, desktop, ui, clipboard: drawing.clipboard }));
+    }
+  }
   registry.register(
     createScreenshotTool({
       capturer: deps.capturer,
@@ -177,6 +207,15 @@ export function createDefaultRegistry(deps: RegistryDependencies): ToolRegistry 
     // Reading further than the first 60 controls — a page at a time, or inside
     // one control — minting references into the SAME store.
     registry.register(createUiReadTool({ ui, store: observations, desktop: deps.desktop ?? null, catalog }));
+  }
+
+  // The browser control plane: the page in the user's OWN default browser,
+  // read and acted on through the same accessibility engine, with references
+  // from the same store. Only where Axon can find the default browser, see
+  // its windows, and read a page.
+  const pageUi = ui && ui.readPage && ui.scrollPage ? (ui as DesktopUi & Required<Pick<DesktopUi, 'readPage' | 'scrollPage'>>) : null;
+  if (pageUi && deps.apps?.appsAvailable && catalog && deps.desktop?.available) {
+    for (const tool of createWebPageTools({ apps: deps.apps, catalog, desktop: deps.desktop, ui: pageUi, store: observations })) registry.register(tool);
   }
 
   // The browser tools exist only when a browser does. A tool the model can see

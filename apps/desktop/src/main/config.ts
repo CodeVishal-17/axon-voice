@@ -14,6 +14,10 @@ export interface RuntimeConfig {
   /** The one directory the agent may write to without asking. */
   readonly workspaceRoot: string;
   readonly screenshotDir: string;
+  /** Where Axon's drawings are written (Drawing). Derived from `axonHome`; no tool takes a path to it. */
+  readonly drawingsDir: string;
+  /** `AXON_DRAW_ENABLED`: on unless set to "false" or "0". Off removes both drawing tools. */
+  readonly drawEnabled: boolean;
   readonly logDir: string;
   readonly eventLogPath: string;
   /**
@@ -178,6 +182,8 @@ export function resolveRuntimeConfig({ home, env, isDev, sessionData }: ConfigIn
     axonHome,
     workspaceRoot: path.join(axonHome, 'workspace'),
     screenshotDir: path.join(axonHome, 'screenshots'),
+    drawingsDir: path.join(axonHome, 'drawings'),
+    drawEnabled: !['false', '0', 'off', 'no'].includes((env.AXON_DRAW_ENABLED ?? '').trim().toLowerCase()),
     logDir,
     eventLogPath: path.join(logDir, 'events.jsonl'),
     databasePath: path.join(dataDir, 'axon.db'),

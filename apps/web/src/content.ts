@@ -68,6 +68,13 @@ export const CAPABILITIES: readonly Capability[] = [
     glyph: 'control',
   },
   {
+    title: 'Draw in Paint',
+    detail: 'After you approve, opens a new Paint window and builds a simple drawing up in it step by step — a house, a sunset, a cat or a tree — through Paint’s own Paste, then reads the canvas back to check it. No mouse automation. Image generation from any description is not configured yet, and Axon says so.',
+    say: 'Open Paint and draw a house.',
+    tools: ['draw.paint', 'draw.generate'],
+    glyph: 'capture',
+  },
+  {
     title: 'Tell the time',
     detail: 'Reads the clock on this machine. No network, no location, no calendar.',
     say: 'What time is it?',

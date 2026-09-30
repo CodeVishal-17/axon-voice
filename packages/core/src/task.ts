@@ -83,6 +83,21 @@ export const TASK_LIMITS = {
    */
   inlineBudgetMs: 2_500,
   /**
+   * The inline budget for READING a page in the user's browser, and for the
+   * steps that lead from one reading to the next (`PAGE_STEP_TOOLS`).
+   *
+   * Browsing is a chain — read, click, read again — and the model can only
+   * take the next step from a result it actually holds. A result later than
+   * `inlineBudgetMs` reaches it as a one-line spoken outcome (the right thing
+   * for a single action, measured in Phase 3) and the chain ends there: live,
+   * "check my latest PR" stopped at "I've found the pull requests link",
+   * because a page read takes 6–9 s. So these steps wait inline longer — still
+   * inside `VOICE_AGENT_LIMITS.toolTimeoutSeconds` with room for the dispatch,
+   * which `voice-agent-timing.test.ts` asserts — and only past this do they
+   * fall back to the acknowledgement path.
+   */
+  pageInlineBudgetMs: 11_000,
+  /**
    * Steps one task may contain.
    *
    * A bound on a multi-step request, not on a conversation: "open YouTube,
@@ -232,6 +247,13 @@ function capitalise(word: string): string {
   return word.charAt(0).toUpperCase() + word.slice(1);
 }
 
+/**
+ * The page tools whose results the model needs in hand to take the next step
+ * (see `TASK_LIMITS.pageInlineBudgetMs`). Read-only or navigation only: an
+ * approval-gated click never runs inline anyway.
+ */
+export const PAGE_STEP_TOOLS: ReadonlySet<string> = new Set(['web.read', 'web.find', 'web.click', 'web.type', 'web.scroll']);
+
 export function describeProgress(tool: string, input: unknown): string | null {
   const args = (input ?? {}) as Record<string, unknown>;
 
@@ -260,6 +282,20 @@ export function describeProgress(tool: string, input: unknown): string | null {
     }
     case 'ui.read':
       return typeof args.app === 'string' && args.app !== '' ? `Looking at ${capitalise(args.app)}` : 'Looking at the screen';
+    case 'web.read':
+      return 'Reading the page';
+    case 'web.find':
+      return 'Looking for that';
+    case 'web.click':
+      return 'Clicking';
+    case 'web.type':
+      return 'Filling that in';
+    case 'web.scroll':
+      return 'Scrolling';
+    case 'draw.paint':
+      return 'Drawing that in Paint';
+    case 'draw.generate':
+      return 'Creating that image';
     case 'app.focus':
       return typeof args.app === 'string' && args.app !== '' ? `Switching to ${capitalise(args.app)}` : 'Switching over';
     case 'system.screenshot':

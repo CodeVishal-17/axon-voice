@@ -235,6 +235,13 @@ describe('filesystem access is narrow and enumerated', () => {
       //   directory, reads each back to verify the runtime configuration, and
       //   deletes them before listening. No audio is ever written.
       'apps/desktop/src/main/wake/kws-focus.ts',
+      // - `draw/artifact-store.ts` (Drawing): writes Axon's own drawings, PNG
+      //   bytes Axon rendered (or a provider returned and Axon checked), into
+      //   ONE directory derived from AXON_HOME, under a name it builds itself
+      //   from a fixed word, the time and random hex. It takes no path from
+      //   anyone, re-checks containment before writing, and uses `wx` so it
+      //   can never overwrite a file.
+      'apps/desktop/src/main/draw/artifact-store.ts',
     ])).toEqual([]);
   });
 
